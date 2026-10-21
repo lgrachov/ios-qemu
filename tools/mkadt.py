@@ -234,6 +234,12 @@ def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False, qemu_
     ])
 
     product_props = d22ap_product()
+    if product_props and qemu_fullfb:
+        # QEMU (--qemu-fullfb): report an sRGB display. With the iPhone X's P3
+        # WebKit renders pages into 10-bit 'w30r' IOSurfaces that come out
+        # blank on this software-rendered display; sRGB selects 8-bit BGRA.
+        product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v)
+                         for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the

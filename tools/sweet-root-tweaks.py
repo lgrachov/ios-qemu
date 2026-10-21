@@ -80,6 +80,17 @@ def launchd(root):
     print(f'launchd.plist: {renamed} _PanicOnCrash renamed, removed {sorted(removed)}')
 
 
+def mobilegestalt_cache(root):
+    """Drop MobileGestalt's answer cache: it keeps device-tree answers (e.g.
+    artwork-display-gamut, which mkadt.py --qemu-fullfb changes to sRGB) across
+    boots. MobileGestalt rebuilds it."""
+    path = os.path.join(root, 'private/var/containers/Shared/SystemGroup/'
+                        'systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist')
+    if os.path.exists(path):
+        os.unlink(path)
+        print('removed', os.path.relpath(path, root))
+
+
 def containers(root):
     base = os.path.join(root, 'private/var/containers')
     for sub, uid in (('Bundle', 33), ('Data/System', 0), ('Shared/SystemGroup', 0), ('Temp', 0)):
@@ -136,6 +147,7 @@ def main():
         sys.exit(__doc__)
     root = sys.argv[1]
     launchd(root)
+    mobilegestalt_cache(root)
     containers(root)
     activation(root)
     audio(root)
