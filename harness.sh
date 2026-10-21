@@ -7,7 +7,8 @@
 # kernel, then runs tools/qemu-sweet.py. --hvf uses Apple Silicon hardware
 # virtualization (its own ADT with the host timer frequency). --ios DISK boots
 # the iOS root on DISK (tools/mkiosroot-mac.sh disk.img) over emulated UFS with
-# the phone's boot-args (implies --hvf). Results (fb.png, fb.txt, result.json)
+# the phone's boot-args (implies --hvf); click/drag in the window = touch,
+# keys P power, H/Esc home, Up/Down volume (patch 0084). Results (fb.png, fb.txt, result.json)
 # go to research/qemu-local/run-<timestamp>/ (research/ is not in git).
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -28,7 +29,7 @@ while [ $# -gt 0 ]; do
 	--hvf) HVF=--hvf; shift ;;
 	--ios) IOS_DISK=$2; HVF=--hvf; shift 2 ;;
 	--) shift; EXTRA=("$@"); break ;;
-	-h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+	-h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 	*) echo "unknown option: $1 (see --help)" >&2; exit 1 ;;
 	esac
 done
@@ -42,7 +43,7 @@ if [ -n "$IOS_DISK" ]; then
 	[ -f "$IOS_DISK" ] || { echo "no disk image at $IOS_DISK" >&2; exit 1; }
 	ADT=$W/q-ios.adt PAYLOAD=$W/payload-ios.bin ADT_ARGS="--hvf --qemu-ufs --highmem" QEMU_ARGS=(--ufs "$IOS_DISK")
 	# the phone's boot-args (NOTES.md), cpus=1
-	CMDLINE="$CMDLINE rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30"
+	CMDLINE="$CMDLINE rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetvinput=1 sweettouch=0"
 fi
 mkdir -p "$W"
 if [ ! -f "$ADT" ] || [ tools/mkadt.py -nt "$ADT" ]; then

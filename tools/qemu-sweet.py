@@ -327,6 +327,9 @@ def main():
     if a.ufs:
         cmd += ['-nic', 'none', '-drive', f'if=none,id=ufsdisk,format=raw,file={os.path.abspath(a.ufs)}',
                 '-device', f'ufs,id=ufs0,serial=sweet,addr={UFS_SLOT:#x}', '-device', 'ufs-lu,drive=ufsdisk,lun=0']
+        # input for bsd/dev/sweet_vinput.c (boot-arg sweetvinput=1): mouse in the window = touch
+        cmd += ['-global', 'virtio-mmio.force-legacy=false',
+                '-device', 'virtio-tablet-device', '-device', 'virtio-keyboard-device']
     if a.display:
         # the 1080x2400 panel is taller than most screens; zoom-to-fit scales the window
         backend = 'cocoa,zoom-to-fit=on' if sys.platform == 'darwin' else 'gtk,zoom-to-fit=on'
