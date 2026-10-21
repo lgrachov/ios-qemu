@@ -331,8 +331,9 @@ def main():
         cmd += ['-global', 'virtio-mmio.force-legacy=false',
                 '-device', 'virtio-tablet-device', '-device', 'virtio-keyboard-device']
     if a.display:
-        # the 1080x2400 panel is taller than most screens; zoom-to-fit scales the window
-        backend = 'cocoa,zoom-to-fit=on' if sys.platform == 'darwin' else 'gtk,zoom-to-fit=on'
+        # the 1080x2400 panel is taller than most screens; zoom-to-fit scales the window.
+        # show-cursor: with the virtio tablet QEMU hides the host cursor (iOS draws none)
+        backend = ('cocoa' if sys.platform == 'darwin' else 'gtk') + ',zoom-to-fit=on,show-cursor=on'
         cmd += ['-device', 'ramfb', '-display', backend, '-monitor', 'none']
     else:
         cmd += ['-nographic']
