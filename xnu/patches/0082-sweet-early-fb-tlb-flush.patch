@@ -1,6 +1,6 @@
 --- a/osfmk/arm64/sweet_early.c
 +++ b/osfmk/arm64/sweet_early.c
-@@ -130,7 +130,12 @@
+@@ -130,7 +130,13 @@
  {
  	sweet_early_mark(8, "leaving bootstrap TTBR0");
  	early_fb = (volatile uint32_t *)(uintptr_t)base;
@@ -9,8 +9,9 @@
 +	 * TTBR1 was just switched without TLB maintenance. Cortex-A55 and QEMU's
 +	 * TCG walk the new tables, but a real Apple core (QEMU -accel hvf) may still
 +	 * hold the bootstrap tables' walk cache entries and fault on the new alias.
++	 * (Newlines, not ';': ';' starts a comment in Apple's arm64 assembler.)
 +	 */
-+	__asm__ volatile("dsb ishst; tlbi vmalle1is; dsb ish; isb" ::: "memory");
++	__asm__ volatile("dsb ishst\n\ttlbi vmalle1is\n\tdsb ish\n\tisb" ::: "memory");
  	sweet_early_mark(9, "kernel framebuffer VA live");
  }
  
