@@ -1,0 +1,13 @@
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -78,7 +78,9 @@
+ 	t.tv_nsec = 0;
+ 
+ // RTC is not present on this target
+-#ifndef BCM2837
++// SWEET: no IORTC driver either (the PMIC RTC is not driven); waiting only
++// cost 30 s per boot before clock_initialize_calendar starts from 0 anyway.
++#if !defined(BCM2837) && !defined(ARM64_BOARD_CONFIG_SWEET)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
+ #endif
