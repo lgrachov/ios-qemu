@@ -2,6 +2,7 @@
 """Wrap a partition image in a GPT disk with 4 KiB sectors, like sweet's UFS LUN 0.
 
   mkufsdisk.py OUT PARTITION.img [--name userdata]
+  mkufsdisk.py --add-mac-gpt DISK          (retrofit the macOS view below)
 
 For tools/qemu-sweet.py --ufs: bsd/dev/sweet_ufs.c reads the GPT header at
 block 1 of 4096-byte blocks and looks the partition up by name (boot-arg
@@ -10,6 +11,11 @@ ufsroot=, default "userdata"); boot with rd=ufsroot0. macOS tools only make
 1 MiB; all-zero 1 MiB chunks are skipped, so OUT stays sparse. The partition
 is 8 MiB longer than the image: with ufsrw=1 the kernel keeps its console
 log in the last 4 MiB + 4 KiB of userdata (patch 0047).
+
+A second, 512-byte-sector GPT (header at byte 512, 4 entries at 1024, backup
+in the padding of the last 4 KiB block) describes the same partition, so
+macOS can mount it in place: hdiutil attach -imagekey
+diskimage-class=CRawDiskImage DISK. The guest only reads the 4 KiB tables.
 """
 import argparse, os, struct, sys, uuid, zlib
 
@@ -30,7 +36,44 @@ def header(cur, backup, first_usable, last_usable, disk_guid, entry_lba, entries
     return h.ljust(BLOCK, b'\0')
 
 
+def mac_gpt(f, total_bytes, part_first, part_last, part_entry_tail):
+    """512-byte-sector GPT for macOS around the same partition (byte bounds)."""
+    n = total_bytes // 512
+    first, last = part_first // 512, (part_last + 1) // 512 - 1
+    entries = (part_entry_tail[:32] + struct.pack('<QQ', first, last) + part_entry_tail[48:]).ljust(4 * ESZ, b'\0')
+    ecrc = zlib.crc32(entries)
+    guid = uuid.uuid4()
+
+    def hdr(cur, backup, entry_lba):
+        h = struct.pack('<8sIIIIQQQQ16sQIII', b'EFI PART', 0x10000, 92, 0, 0, cur, backup,
+                        first, last, guid.bytes_le, entry_lba, 4, ESZ, ecrc)
+        return (h[:16] + struct.pack('<I', zlib.crc32(h)) + h[20:]).ljust(512, b'\0')
+    mbr = bytearray(512)
+    mbr[446:462] = struct.pack('<BBBBBBBBII', 0, 0, 2, 0, 0xee, 0xff, 0xff, 0xff, 1, min(n - 1, 0xffffffff))
+    mbr[510:512] = b'\x55\xaa'
+    f.seek(0)
+    f.write(mbr + hdr(1, n - 1, 2) + entries)
+    f.seek((n - 2) * 512)
+    f.write(entries[:512] + hdr(n - 1, 1, n - 2))
+
+
+def add_mac_gpt(path):
+    with open(path, 'r+b') as f:
+        f.seek(BLOCK)
+        h = f.read(92)
+        assert h[:8] == b'EFI PART', 'no 4 KiB GPT at block 1'
+        entry_lba = struct.unpack_from('<Q', h, 72)[0]
+        f.seek(entry_lba * BLOCK)
+        e = f.read(ESZ)
+        pfirst, plast = struct.unpack_from('<QQ', e, 32)
+        total = os.path.getsize(path)
+        mac_gpt(f, total, pfirst * BLOCK, (plast + 1) * BLOCK - 1, e)
+    print(f'{path}: added 512-byte GPT for macOS', file=sys.stderr)
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == '--add-mac-gpt':
+        return add_mac_gpt(sys.argv[2])
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('out')
     ap.add_argument('partition')
@@ -72,6 +115,7 @@ def main():
                     f.seek(FIRST * BLOCK + off)
                     f.write(buf)
                 off += len(buf)
+        mac_gpt(f, total * BLOCK, FIRST * BLOCK, (last + 1) * BLOCK - 1, entry)
     print(f'{a.out}: {total * BLOCK} bytes, partition "{a.name}" blocks {FIRST}..{last} '
           f'({pblocks * BLOCK} bytes)', file=sys.stderr)
 
