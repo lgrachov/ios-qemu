@@ -334,6 +334,8 @@ def main():
         # input for bsd/dev/sweet_vinput.c (boot-arg sweetvinput=1): mouse in the window = touch
         cmd += ['-global', 'virtio-mmio.force-legacy=false',
                 '-device', 'virtio-tablet-device', '-device', 'virtio-keyboard-device']
+        # en0 for bsd/dev/sweet_vnet.c (sweetvnet=1): user-mode NAT, DHCP 10.0.2.15
+        cmd += ['-netdev', 'user,id=net0', '-device', 'virtio-net-device,netdev=net0']
     if a.display:
         # the 1080x2400 panel is taller than most screens; zoom-to-fit scales the window.
         # show-cursor: with the virtio tablet QEMU hides the host cursor (iOS draws none)

@@ -1,0 +1,545 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_vinput.c			standard
++bsd/dev/sweet_vnet.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_vinput_init(void);
++extern void sweet_vnet_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -662,6 +663,7 @@
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
+ 	sweet_vinput_init();         /* QEMU only (boot-arg sweetvinput=1) */
++	sweet_vnet_init();           /* QEMU only (boot-arg sweetvnet=1) */
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_vnet.c b/bsd/dev/sweet_vnet.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_vnet.c
+@@ -0,0 +1,446 @@
++/*
++ * SWEET under QEMU: virtio-net (virtio-mmio, modern) as the Ethernet
++ * interface en0.
++ *
++ * Boot-arg sweetvnet=1 (harness.sh --ios; never on the phone, whose MMIO at
++ * these addresses is something else). Finds QEMU virt's virtio-mmio network
++ * device (ID 1), negotiates only VIRTIO_F_VERSION_1 and VIRTIO_NET_F_MAC
++ * (12-byte header, no offloads, one buffer per packet), and polls both rings
++ * from one thread. Frames go through ifnet_input / the ifnet output callback
++ * as in bsd/dev/sweet_usb.c. The address comes from configd (DHCP against
++ * QEMU's -netdev user); for that SystemConfiguration needs an IOKit
++ * IONetworkInterface below a controller with IOMACAddress, which
++ * sweet_vnet_publish() (iokit/Kernel/arm/SweetNetworkStack.cpp) provides.
++ *
++ * QEMU's virtio is cache coherent with the guest, so no cache maintenance.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/sockio.h>
++#include <sys/kern_event.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/locks.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/if_media.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/dlil.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_vnet_publish(const uint8_t *mac, const char *bsd_name, uint32_t unit);
++void sweet_vnet_init(void);
++
++#define VMMIO_PA        0x0a000000u
++#define VMMIO_STRIDE    0x200u
++#define VMMIO_SLOTS     32u
++
++#define VM_MAGIC        0x000
++#define VM_VERSION      0x004
++#define VM_DEVICE_ID    0x008
++#define VM_DEV_FEAT     0x010
++#define VM_DEV_FEAT_SEL 0x014
++#define VM_DRV_FEAT     0x020
++#define VM_DRV_FEAT_SEL 0x024
++#define VM_QUEUE_SEL    0x030
++#define VM_QUEUE_MAX    0x034
++#define VM_QUEUE_NUM    0x038
++#define VM_QUEUE_READY  0x044
++#define VM_QUEUE_NOTIFY 0x050
++#define VM_INT_STATUS   0x060
++#define VM_INT_ACK      0x064
++#define VM_STATUS       0x070
++#define VM_DESC_LO      0x080
++#define VM_DESC_HI      0x084
++#define VM_AVAIL_LO     0x090
++#define VM_AVAIL_HI     0x094
++#define VM_USED_LO      0x0a0
++#define VM_USED_HI      0x0a4
++#define VM_CONFIG       0x100           /* virtio_net_config: mac[6] first */
++
++#define ST_ACK          1u
++#define ST_DRIVER       2u
++#define ST_DRIVER_OK    4u
++#define ST_FEATURES_OK  8u
++#define VIRTIO_F_VERSION_1_HI 1u        /* feature bit 32 */
++#define VIRTIO_NET_F_MAC (1u << 5)
++#define VIRTIO_ID_NET   1u
++#define VRING_DESC_F_WRITE 2u
++
++#define QSIZE           64u
++#define BUF_SIZE        2048u
++#define NET_HDR         12u             /* virtio_net_hdr with num_buffers (VERSION_1) */
++#define RXQ             0u
++#define TXQ             1u
++/* One contiguous allocation: per queue a 4 KiB ring page, then the buffers. */
++#define RING_DESC       0x000           /* 16 * QSIZE */
++#define RING_AVAIL      0x400           /* 4 + 2 * QSIZE */
++#define RING_USED       0x800           /* 4 + 8 * QSIZE */
++#define OFF_RING(q)     ((q) * 0x1000u)
++#define OFF_BUF(q, i)   (0x2000u + ((q) * QSIZE + (i)) * BUF_SIZE)
++#define DMA_SIZE        (0x2000u + 2 * QSIZE * BUF_SIZE)
++
++struct vring_desc {
++	uint64_t addr;
++	uint32_t len;
++	uint16_t flags;
++	uint16_t next;
++};
++
++static struct {
++	vm_offset_t regs;
++	vm_offset_t dma;
++	uint64_t dma_pa;
++	uint16_t rx_used;               /* used entries consumed */
++	uint16_t tx_used;
++	uint16_t tx_avail;              /* buffers handed to the device */
++	uint8_t mac[ETHER_ADDR_LEN];
++	ifnet_t ifp;
++	lck_mtx_t *lock;                /* tx ring */
++	bool started;
++} vn;
++static int vnet_sleep_chan;
++
++static uint32_t
++vm_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(vn.regs + off);
++}
++
++static void
++vm_wr(uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb ish" ::: "memory");
++	*(volatile uint32_t *)(vn.regs + off) = val;
++}
++
++static volatile uint16_t *
++ring16(unsigned q, uint32_t off)
++{
++	return (volatile uint16_t *)(vn.dma + OFF_RING(q) + off);
++}
++
++static void
++vnet_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&vnet_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++vnet_queue_setup(unsigned q, bool device_writes)
++{
++	struct vring_desc *desc = (struct vring_desc *)(vn.dma + OFF_RING(q) + RING_DESC);
++	uint64_t ring = vn.dma_pa + OFF_RING(q);
++	for (unsigned i = 0; i < QSIZE; i++) {
++		desc[i].addr = vn.dma_pa + OFF_BUF(q, i);
++		desc[i].len = BUF_SIZE;
++		desc[i].flags = device_writes ? VRING_DESC_F_WRITE : 0;
++		desc[i].next = 0;
++	}
++	vm_wr(VM_QUEUE_SEL, q);
++	vm_wr(VM_QUEUE_NUM, QSIZE);
++	vm_wr(VM_DESC_LO, (uint32_t)(ring + RING_DESC));
++	vm_wr(VM_DESC_HI, (uint32_t)((ring + RING_DESC) >> 32));
++	vm_wr(VM_AVAIL_LO, (uint32_t)(ring + RING_AVAIL));
++	vm_wr(VM_AVAIL_HI, (uint32_t)((ring + RING_AVAIL) >> 32));
++	vm_wr(VM_USED_LO, (uint32_t)(ring + RING_USED));
++	vm_wr(VM_USED_HI, (uint32_t)((ring + RING_USED) >> 32));
++	vm_wr(VM_QUEUE_READY, 1);
++}
++
++static int
++vnet_device_setup(void)
++{
++	vm_wr(VM_STATUS, 0);
++	vm_wr(VM_STATUS, ST_ACK);
++	vm_wr(VM_STATUS, ST_ACK | ST_DRIVER);
++	vm_wr(VM_DEV_FEAT_SEL, 1);
++	if (!(vm_rd(VM_DEV_FEAT) & VIRTIO_F_VERSION_1_HI)) {
++		return ENOTSUP;
++	}
++	vm_wr(VM_DEV_FEAT_SEL, 0);
++	uint32_t low = vm_rd(VM_DEV_FEAT) & VIRTIO_NET_F_MAC;
++	vm_wr(VM_DRV_FEAT_SEL, 0);
++	vm_wr(VM_DRV_FEAT, low);
++	vm_wr(VM_DRV_FEAT_SEL, 1);
++	vm_wr(VM_DRV_FEAT, VIRTIO_F_VERSION_1_HI);
++	vm_wr(VM_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK);
++	if (!(vm_rd(VM_STATUS) & ST_FEATURES_OK)) {
++		return ENOTSUP;
++	}
++	for (unsigned q = RXQ; q <= TXQ; q++) {
++		vm_wr(VM_QUEUE_SEL, q);
++		if (vm_rd(VM_QUEUE_READY) || vm_rd(VM_QUEUE_MAX) < QSIZE) {
++			return ENXIO;
++		}
++	}
++	if (kmem_alloc_contig(kernel_map, &vn.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)vn.dma);
++	if (!pn) {
++		return ENOMEM;
++	}
++	vn.dma_pa = ptoa_64(pn);
++	if (low & VIRTIO_NET_F_MAC) {
++		for (unsigned i = 0; i < ETHER_ADDR_LEN; i++) {
++			vn.mac[i] = *(volatile uint8_t *)(vn.regs + VM_CONFIG + i);
++		}
++	} else {
++		static const uint8_t fallback[ETHER_ADDR_LEN] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
++		memcpy(vn.mac, fallback, sizeof(fallback));
++	}
++
++	vnet_queue_setup(RXQ, true);
++	vnet_queue_setup(TXQ, false);
++	/* Offer every receive buffer. */
++	for (unsigned i = 0; i < QSIZE; i++) {
++		ring16(RXQ, RING_AVAIL)[2 + i] = (uint16_t)i;
++	}
++	__asm__ volatile("dmb ish" ::: "memory");
++	ring16(RXQ, RING_AVAIL)[1] = QSIZE;
++	vm_wr(VM_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK | ST_DRIVER_OK);
++	vm_wr(VM_QUEUE_NOTIFY, RXQ);
++	return 0;
++}
++
++/* Reclaim transmitted buffers; called with vn.lock held. */
++static void
++vnet_tx_reclaim_locked(void)
++{
++	while (vn.tx_used != ring16(TXQ, RING_USED)[1]) {
++		vn.tx_used++;
++	}
++}
++
++static errno_t
++vnet_if_output(ifnet_t ifp, mbuf_t m)
++{
++	size_t len = mbuf_pkthdr_len(m);
++	errno_t err = 0;
++
++	lck_mtx_lock(vn.lock);
++	vnet_tx_reclaim_locked();
++	if (len > BUF_SIZE - NET_HDR || (uint16_t)(vn.tx_avail - vn.tx_used) >= QSIZE) {
++		err = ENOBUFS;          /* oversize or ring full: drop */
++	} else {
++		unsigned slot = vn.tx_avail % QSIZE;
++		uint8_t *buf = (uint8_t *)(vn.dma + OFF_BUF(TXQ, slot));
++		struct vring_desc *desc = (struct vring_desc *)(vn.dma + OFF_RING(TXQ) + RING_DESC);
++		bzero(buf, NET_HDR);
++		mbuf_copydata(m, 0, len, buf + NET_HDR);
++		desc[slot].len = (uint32_t)(NET_HDR + len);
++		ring16(TXQ, RING_AVAIL)[2 + slot] = (uint16_t)slot;
++		__asm__ volatile("dmb ish" ::: "memory");
++		vn.tx_avail++;
++		ring16(TXQ, RING_AVAIL)[1] = vn.tx_avail;
++		vm_wr(VM_QUEUE_NOTIFY, TXQ);
++	}
++	lck_mtx_unlock(vn.lock);
++	if (err == 0) {
++		ifnet_stat_increment_out(ifp, 1, (u_int32_t)len, 0);
++	} else {
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++	}
++	mbuf_freem(m);
++	return 0;
++}
++
++static void
++vnet_rx_poll(void)
++{
++	volatile uint16_t *avail = ring16(RXQ, RING_AVAIL);
++	bool refilled = false;
++
++	while (vn.rx_used != ring16(RXQ, RING_USED)[1]) {
++		__asm__ volatile("dmb ish" ::: "memory");
++		volatile uint32_t *elem = (volatile uint32_t *)(vn.dma + OFF_RING(RXQ) + RING_USED + 4 + 8 * (vn.rx_used % QSIZE));
++		uint32_t id = elem[0], len = elem[1];
++		if (id < QSIZE && len > NET_HDR + ETHER_HDR_LEN && len <= BUF_SIZE) {
++			size_t flen = len - NET_HDR;
++			mbuf_t m = NULL;
++			if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++			    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++			    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= flen) {
++				struct ifnet_stat_increment_param stats = { .packets_in = 1, .bytes_in = (u_int32_t)flen };
++				memcpy(mbuf_data(m), (const void *)(vn.dma + OFF_BUF(RXQ, id) + NET_HDR), flen);
++				mbuf_setlen(m, flen);
++				mbuf_pkthdr_setlen(m, flen);
++				void *frame_header = mbuf_data(m);
++				mbuf_pkthdr_setrcvif(m, vn.ifp);
++				mbuf_pkthdr_setheader(m, frame_header);
++				mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++				(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++				ifnet_input(vn.ifp, m, &stats);
++			} else if (m != NULL) {
++				mbuf_freem(m);
++			}
++		}
++		if (id < QSIZE) {
++			avail[2 + avail[1] % QSIZE] = (uint16_t)id;
++			__asm__ volatile("dmb ish" ::: "memory");
++			avail[1] = (uint16_t)(avail[1] + 1);
++			refilled = true;
++		}
++		vn.rx_used++;
++	}
++	if (refilled) {
++		vm_wr(VM_QUEUE_NOTIFY, RXQ);
++	}
++	if (vm_rd(VM_INT_STATUS)) {
++		vm_wr(VM_INT_ACK, vm_rd(VM_INT_STATUS));
++	}
++}
++
++static errno_t
++vnet_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++{
++	switch (cmd) {
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64: {
++		struct ifmediareq *ifmr = (struct ifmediareq *)data;
++		user_addr_t list = (cmd == SIOCGIFMEDIA64) ?
++		    ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
++		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
++		int media = IFM_ETHER | IFM_1000_T | IFM_FDX;
++		ifmr->ifm_current = media;
++		ifmr->ifm_active = media;
++		ifmr->ifm_mask = 0;
++		ifmr->ifm_status = IFM_AVALID | IFM_ACTIVE;
++		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
++			ifmr->ifm_count = 1;
++			return copyout(&media, list, sizeof(media));
++		}
++		ifmr->ifm_count = 1;
++		return 0;
++	}
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++vnet_if_detach(ifnet_t ifp __unused)
++{
++}
++
++static int
++vnet_if_create(void)
++{
++	struct ifnet_init_eparams init;
++
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "sweet-virtio-net";
++	init.uniqueid_len = sizeof("sweet-virtio-net") - 1;
++	init.name = "en";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = vnet_if_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = vnet_if_ioctl;
++	init.detach = vnet_if_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	if (ifnet_allocate_extended(&init, &vn.ifp) != 0) {
++		vn.ifp = NULL;
++		return ENOMEM;
++	}
++	ifnet_set_addrlen(vn.ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(vn.ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(vn.ifp, ETHERMTU);
++	ifnet_set_baudrate(vn.ifp, 1000000000);
++	ifnet_set_flags(vn.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(vn.ifp, NULL) != 0) {
++		vn.ifp = NULL;
++		return ENXIO;
++	}
++	ifnet_set_lladdr(vn.ifp, vn.mac, ETHER_ADDR_LEN);
++	dlil_post_msg(vn.ifp, KEV_DL_SUBCLASS, KEV_DL_LINK_ON, NULL, 0, FALSE);
++	return 0;
++}
++
++static void
++vnet_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	vm_offset_t base = ml_io_map(VMMIO_PA, VMMIO_SLOTS * VMMIO_STRIDE);
++	unsigned slot;
++	for (slot = 0; slot < VMMIO_SLOTS; slot++) {
++		vn.regs = base + slot * VMMIO_STRIDE;
++		if (vm_rd(VM_MAGIC) == 0x74726976 && vm_rd(VM_DEVICE_ID) == VIRTIO_ID_NET) {
++			break;
++		}
++	}
++	int err = slot == VMMIO_SLOTS ? ENODEV : vm_rd(VM_VERSION) != 2 ? ENOTSUP : vnet_device_setup();
++	if (!err) {
++		err = vnet_if_create();
++	}
++	printf("SWEET VNET: slot %u -> %d, en0 %02x:%02x:%02x:%02x:%02x:%02x\n", slot, err,
++	    vn.mac[0], vn.mac[1], vn.mac[2], vn.mac[3], vn.mac[4], vn.mac[5]);
++	if (err) {
++		(void)thread_terminate(current_thread());
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	sweet_vnet_publish(vn.mac, "en0", 0);
++	for (;;) {
++		vnet_rx_poll();
++		lck_mtx_lock(vn.lock);
++		vnet_tx_reclaim_locked();
++		lck_mtx_unlock(vn.lock);
++		vnet_wait(2);
++	}
++}
++
++void
++sweet_vnet_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	if (vn.started) {
++		return;
++	}
++	vn.started = true;
++	(void)PE_parse_boot_argn("sweetvnet", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++	vn.lock = lck_mtx_alloc_init(lck_grp_alloc_init("sweet_vnet", LCK_GRP_ATTR_NULL), LCK_ATTR_NULL);
++	if (kernel_thread_start(vnet_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetNetworkStack.cpp b/iokit/Kernel/arm/SweetNetworkStack.cpp
+--- a/iokit/Kernel/arm/SweetNetworkStack.cpp
++++ b/iokit/Kernel/arm/SweetNetworkStack.cpp
+@@ -67,4 +67,60 @@
+ 	IOLog("SWEET NETSTACK: %s naming command ignored\n", name);
+ 	return kIOReturnSuccess;
+ }
++
++/*
++ * IOKit side of bsd/dev/sweet_vnet.c's en0 (QEMU virtio-net), in the shape
++ * SystemConfiguration's createInterface() walks (SCNetworkInterface.c):
++ * IONetworkInterface (type, BSD name, prefix/unit, built-in) below a
++ * controller (IOMACAddress; IOSelfNamed, so InterfaceNamer sends no naming
++ * command) below a bus with a name (IOResources).
++ */
++class SweetVirtioNet : public IOService {
++	OSDeclareDefaultStructors(SweetVirtioNet);
++};
++OSDefineMetaClassAndStructors(SweetVirtioNet, IOService);
++
++class IONetworkInterface : public IOService {
++	OSDeclareDefaultStructors(IONetworkInterface);
++};
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++extern "C" void
++sweet_vnet_publish(const uint8_t *mac, const char *bsd_name, uint32_t unit)
++{
++	IOService *resources = IOService::getResourceService();
++	SweetVirtioNet *controller = new SweetVirtioNet;
++	IONetworkInterface *interface = new IONetworkInterface;
++	OSData *address = OSData::withBytes(mac, 6);
++
++	if (resources == NULL || controller == NULL || interface == NULL || address == NULL ||
++	    !controller->init() || !interface->init()) {
++		IOLog("SWEET NETSTACK: cannot publish %s\n", bsd_name);
++		OSSafeReleaseNULL(controller);
++		OSSafeReleaseNULL(interface);
++		OSSafeReleaseNULL(address);
++		return;
++	}
++	controller->setName("virtio-net");
++	controller->setProperty("IOMACAddress", address);
++	controller->setProperty("IOSelfNamed", kOSBooleanTrue);
++	controller->setProperty("IOVendor", "QEMU");
++	controller->setProperty("IOModel", "virtio-net");
++	interface->setName(bsd_name);
++	interface->setProperty("IOInterfaceType", 6ULL, 32);           /* IFT_ETHER */
++	interface->setProperty("IOInterfaceNamePrefix", "en");
++	interface->setProperty("IOInterfaceUnit", (unsigned long long)unit, 32);
++	interface->setProperty("BSD Name", bsd_name);
++	interface->setProperty("IOBuiltin", kOSBooleanTrue);
++	interface->setProperty("IOPrimaryInterface", kOSBooleanTrue);
++	interface->setProperty("IOMaxTransferUnit", 1500ULL, 32);
++	if (controller->attach(resources) && interface->attach(controller)) {
++		controller->registerService();
++		interface->registerService();
++		IOLog("SWEET NETSTACK: published IONetworkInterface %s\n", bsd_name);
++	}
++	controller->release();
++	interface->release();
++	address->release();
++}
+ #endif /* SWEET */

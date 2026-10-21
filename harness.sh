@@ -46,7 +46,7 @@ if [ -n "$IOS_DISK" ]; then
 	[ -f "$IOS_DISK" ] || { echo "no disk image at $IOS_DISK" >&2; exit 1; }
 	ADT=$W/q-ios.adt PAYLOAD=$W/payload-ios.bin ADT_ARGS="--hvf --qemu-ufs --qemu-fullfb --highmem" QEMU_ARGS=(--ufs "$IOS_DISK" --fullfb)
 	# the phone's boot-args (NOTES.md), cpus=1
-	CMDLINE="$CMDLINE rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetvinput=1 sweettouch=0"
+	CMDLINE="$CMDLINE rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetvinput=1 sweetvnet=1 sweettouch=0"
 fi
 mkdir -p "$W"
 [ -z "$MORE_ARGS" ] || CMDLINE="$CMDLINE $MORE_ARGS"
