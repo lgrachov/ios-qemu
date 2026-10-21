@@ -10,7 +10,8 @@ turned the plain mkiosroot.sh output into the images that reach the home
 screen (image versions v8-v14 in NOTES.md):
 
   launchd.plist   _PanicOnCrash -> _PanicOnCrasX (a crashing daemon must not
-                  panic the system); CommCenter jobs removed (no baseband: it
+                  panic the system); jobs in REMOVED_JOBS removed: CommCenter
+                  (no baseband: it
                   crash-loops and Setup blocks on its CoreTelephony XPC)
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
@@ -30,6 +31,14 @@ screen (image versions v8-v14 in NOTES.md):
 import glob, os, plistlib, shutil, sys
 
 BUILD, VERSION = '20H392', '16.7.16'
+# launchd jobs that must not run here:
+#   CommCenter  no baseband (see above)
+#   locationd   deadlocks itself during boot without location hardware (QEMU,
+#               2026-10-21: two threads in dispatch_sync on the queue a third
+#               holds while waiting in mach_msg); every synchronous CoreLocation
+#               caller then hangs, e.g. Settings > General > Date & Time. Without
+#               the job, clients get an invalid connection at once.
+REMOVED_JOBS = ('com.apple.CommCenter', 'com.apple.locationd')
 MOBILE = 501
 
 
@@ -64,11 +73,11 @@ def launchd(root):
         if '_PanicOnCrash' in job:
             job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
             renamed += 1
-    removed = [k for k, j in jobs.items() if j.get('Label') == 'com.apple.CommCenter']
+    removed = [k for k, j in jobs.items() if j.get('Label') in REMOVED_JOBS]
     for k in removed:
         del jobs[k]
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, removed {sorted(removed)}')
 
 
 def containers(root):
