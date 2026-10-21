@@ -1,0 +1,31 @@
+diff --git a/libkern/c++/OSKext.cpp b/libkern/c++/OSKext.cpp
+--- a/libkern/c++/OSKext.cpp
++++ b/libkern/c++/OSKext.cpp
+@@ -1481,6 +1481,15 @@
+ bool
+ OSKext::iokitDaemonAvailable(void)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * iOS has no kernelmanagerd. With this macOS-source kernel waiting for
++	 * it, the registry root kept the daemon's busy count forever, so IOKit
++	 * never went quiet: configd's InterfaceNamer timed out and every
++	 * SCNetworkInterface caller (Settings > General > About) waited minutes.
++	 */
++	return false;
++#endif
+ 	int notused;
+ 	if (PE_parse_boot_argn("-restore", &notused, sizeof(notused))) {
+ 		return false;
+diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -1611,7 +1611,7 @@
+ {
+ 	gIOPMRootDomain = rootDomain;
+ 	publishResource(gIOResourceIOKitKey);
+-#if NO_KEXTD
++#if NO_KEXTD || defined(ARM64_BOARD_CONFIG_SWEET)
+ 	// Publish IOUserResources now since there is no IOKit daemon.
+ 	publishUserResource(gIOResourceIOKitKey);
+ #endif
