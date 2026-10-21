@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--hvf] [--qemu-ufs] [--highmem]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--hvf] [--qemu-ufs] [--qemu-fullfb] [--highmem]
 """
 import hashlib, os, struct, sys
 
@@ -31,6 +31,9 @@ GICR, GICR_SIZE = 0x17a60000, 0x100000
 FB, FB_SIZE = 0x9c000000, 0x1700000
 SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
+# QEMU (qemu-sweet.py --fullfb): the whole presented iPhone X display, no crop.
+# Unpadded rows (iOS pads its own surfaces to 4608; nothing needs it here).
+QEMU_FULL_FB = 1125, 2436, 1125 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 # qemu-sweet.py --ufs: QEMU's UFSHCI PCI device, BAR set by its boot stub (UFS_BAR there)
@@ -78,11 +81,13 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False):
+def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False, qemu_fullfb=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     hvf=True (implies qemu): the host's counter frequency, for qemu-sweet.py --hvf.
-    qemu_ufs=True (implies qemu): /sweet-ufs at QEMU's UFS BAR, for qemu-sweet.py --ufs."""
-    qemu = qemu or hvf or qemu_ufs
+    qemu_ufs=True (implies qemu): /sweet-ufs at QEMU's UFS BAR, for qemu-sweet.py --ufs.
+    qemu_fullfb=True (implies qemu): a 1125x2436 sweet-fbcon, for qemu-sweet.py --fullfb."""
+    qemu = qemu or hvf or qemu_ufs or qemu_fullfb
+    fb_w, fb_h, fb_stride = QEMU_FULL_FB if qemu_fullfb else (FB_W, FB_H, FB_STRIDE)
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
@@ -201,9 +206,9 @@ def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False):
     fbcon = node('sweet-fbcon', [
         ph(),
         ('reg', u64(FB, FB_SIZE)),
-        ('width', u32(FB_W)),
-        ('height', u32(FB_H)),
-        ('stride', u32(FB_STRIDE)),
+        ('width', u32(fb_w)),
+        ('height', u32(fb_h)),
+        ('stride', u32(fb_stride)),
     ])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
@@ -252,7 +257,7 @@ def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False):
 
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, hvf='--hvf' in sys.argv,
-                 qemu_ufs='--qemu-ufs' in sys.argv)
+                 qemu_ufs='--qemu-ufs' in sys.argv, qemu_fullfb='--qemu-fullfb' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

@@ -132,7 +132,7 @@ def ramfb_stub(ba_pa, entry_pa, out, ufs=False):
     obj = f'{out}/ramfb-stub.o'
     subprocess.check_call(clang + ['-target', 'aarch64-none-elf', '-c', src, '-o', obj,
                                    f'-DBOOT_ARGS={ba_pa:#x}', f'-DENTRY={entry_pa:#x}',
-                                   f'-DFB_BASE={FB_BASE:#x}', f'-DFB_W={FB_W}', f'-DFB_H={FB_H}']
+                                   f'-DFB_BASE={FB_BASE:#x}', f'-DFB_W={FB_W}', f'-DFB_H={FB_H}', f'-DFB_STRIDE={FB_STRIDE}']
                           + ([f'-DUFS_BAR={UFS_BAR:#x}', f'-DUFS_SLOT={UFS_SLOT}'] if ufs else []))
     data = open(obj, 'rb').read()
     os.unlink(obj)
@@ -268,9 +268,13 @@ def main():
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
     ap.add_argument('--hvf', action='store_true', help='hardware virtualization on Apple Silicon (-accel hvf -cpu host); needs an ADT from mkadt.py --hvf')
     ap.add_argument('--ufs', metavar='DISK', help='raw disk image (4 KiB-sector GPT, e.g. a "userdata" HFS+ partition) as a UFS LU; needs an ADT from mkadt.py --qemu-ufs and rd=ufsroot0')
+    ap.add_argument('--fullfb', action='store_true', help='1125x2436 framebuffer (the whole iOS display, no crop); needs an ADT from mkadt.py --qemu-fullfb and kernel 0085')
     ap.add_argument('--display', action='store_true', help='show the framebuffer live in a QEMU window (ramfb; needs clang)')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     a = ap.parse_args()
+    if a.fullfb:
+        global FB_W, FB_H, FB_STRIDE
+        FB_W, FB_H, FB_STRIDE = 1125, 2436, 1125 * 4	# mkadt.py QEMU_FULL_FB
 
     if a.check_env:
         ok = check_qemu_dependency(a.cpu)

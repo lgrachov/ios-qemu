@@ -8,14 +8,16 @@
   qemu-touch.py RUN_DIR screenshot OUT.png
 
 RUN_DIR is the qemu-sweet.py output directory (its QMP socket mon.sock).
-X/Y are panel pixels (1080x2400, as in fb.png). Events go through QMP
+X/Y are screen pixels as in the screenshots: 1125x2436 (harness.sh --ios uses
+qemu-sweet.py --fullfb; set QEMU_TOUCH_PANEL=1080x2400 for the phone layout). Events go through QMP
 input-send-event to the virtio-tablet/-keyboard that bsd/dev/sweet_vinput.c
 (patch 0084, boot-arg sweetvinput=1) turns into SweetHID touch and buttons,
 the same path as clicking in the QEMU window.
 """
-import json, os, socket, subprocess, sys, time
+import json, os, socket, sys, time
 
-PANEL_W, PANEL_H, ABS_MAX = 1080, 2400, 0x7fff
+PANEL_W, PANEL_H = map(int, os.environ.get('QEMU_TOUCH_PANEL', '1125x2436').split('x'))
+ABS_MAX = 0x7fff
 KEYS = {'power': 'p', 'home': 'h', 'volup': 'up', 'voldown': 'down'}
 
 
@@ -85,10 +87,8 @@ def main():
         time.sleep((float(args[1]) if len(args) > 1 else 100) / 1000)
         q.events({'type': 'key', 'data': {'down': False, 'key': k}})
     elif cmd == 'screenshot':
-        ppm = os.path.abspath(args[0]) + '.ppm'
-        q.call('screendump', filename=ppm)
-        subprocess.check_call(['sips', '-s', 'format', 'png', ppm, '--out', args[0]], stdout=subprocess.DEVNULL)
-        os.unlink(ppm)
+        # PNG: QEMU's PPM screendump shears odd widths (rows padded to 4 bytes)
+        q.call('screendump', filename=os.path.abspath(args[0]), format='png')
     else:
         sys.exit(__doc__)
     q.close()

@@ -4,7 +4,7 @@
  * x0 = boot_args. ramfb then shows that guest RAM live in the QEMU window.
  *
  * Built by qemu-sweet.py with
- *   clang -target aarch64-none-elf -c -DBOOT_ARGS=.. -DENTRY=.. -DFB_BASE=.. -DFB_W=.. -DFB_H=..
+ *   clang -target aarch64-none-elf -c -DBOOT_ARGS=.. -DENTRY=.. -DFB_BASE=.. -DFB_W=.. -DFB_H=.. -DFB_STRIDE=..
  * Runs at EL1 with the MMU off: every access is Device memory, so all
  * loads and stores must be naturally aligned.
  *
@@ -156,7 +156,7 @@ cfg:		/* RAMFBCfg: be64 addr, be32 fourcc, flags, width, height, stride */
 	be32	0
 	be32	FB_W
 	be32	FB_H
-	be32	(FB_W * 4)
+	be32	FB_STRIDE
 cfg_end:
 ramfb_name:	.asciz "etc/ramfb"
 	.balign 16

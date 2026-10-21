@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Boot the local kernel in QEMU with a live display window.
 #
-#   ./harness.sh [--secs N] [--no-display] [--hvf] [--ios DISK] [--kernel PATH] [-- extra qemu-sweet.py args]
+#   ./harness.sh [--secs N] [--no-display] [--hvf] [--ios DISK] [--bootargs "..."] [--kernel PATH] [-- extra qemu-sweet.py args]
 #
 # Rebuilds the QEMU ADT and payload when they are missing or older than the
 # kernel, then runs tools/qemu-sweet.py. --hvf uses Apple Silicon hardware
@@ -20,11 +20,13 @@ HVF=
 IOS_DISK=
 CMDLINE='debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress'
 EXTRA=()
+MORE_ARGS=
 
 while [ $# -gt 0 ]; do
 	case $1 in
 	--secs) SECS=$2; shift 2 ;;
 	--kernel) KERNEL=$2; shift 2 ;;
+	--bootargs) MORE_ARGS=$2; shift 2 ;;
 	--no-display) DISPLAY_ARG=; shift ;;
 	--hvf) HVF=--hvf; shift ;;
 	--ios) IOS_DISK=$2; HVF=--hvf; shift 2 ;;
@@ -41,11 +43,12 @@ ADT=$W/q${HVF:+-hvf}.adt PAYLOAD=$W/payload${HVF:+-hvf}.bin
 ADT_ARGS="--qemu $HVF" QEMU_ARGS=()
 if [ -n "$IOS_DISK" ]; then
 	[ -f "$IOS_DISK" ] || { echo "no disk image at $IOS_DISK" >&2; exit 1; }
-	ADT=$W/q-ios.adt PAYLOAD=$W/payload-ios.bin ADT_ARGS="--hvf --qemu-ufs --highmem" QEMU_ARGS=(--ufs "$IOS_DISK")
+	ADT=$W/q-ios.adt PAYLOAD=$W/payload-ios.bin ADT_ARGS="--hvf --qemu-ufs --qemu-fullfb --highmem" QEMU_ARGS=(--ufs "$IOS_DISK" --fullfb)
 	# the phone's boot-args (NOTES.md), cpus=1
 	CMDLINE="$CMDLINE rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetvinput=1 sweettouch=0"
 fi
 mkdir -p "$W"
+[ -z "$MORE_ARGS" ] || CMDLINE="$CMDLINE $MORE_ARGS"
 if [ ! -f "$ADT" ] || [ tools/mkadt.py -nt "$ADT" ]; then
 	python3 tools/mkadt.py "$ADT" $ADT_ARGS
 fi
