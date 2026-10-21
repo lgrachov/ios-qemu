@@ -27,7 +27,8 @@ img=$outdir/root.hfs disk=$outdir/disk.img
 work=$(mktemp -d /tmp/mkiosroot.XXXXXX)
 mounts=() devs=()
 cleanup() {
-	for m in ${mounts[@]+"${mounts[@]}"}; do umount "$m" 2>/dev/null || true; done
+	# by mount point: detaching a UDIF image's first device can leave its APFS volume mounted
+	for m in ${mounts[@]+"${mounts[@]}"}; do hdiutil detach -force "$m" >/dev/null 2>&1 || true; done
 	for d in ${devs[@]+"${devs[@]}"}; do hdiutil detach -force "$d" >/dev/null 2>&1 || true; done
 	rmdir "$work"/* "$work" 2>/dev/null || echo "left $work in place" >&2
 }
@@ -36,8 +37,8 @@ trap cleanup EXIT
 attach_ro() {	# DMG NAME
 	mkdir "$work/$2"
 	local dev
-	dev=$(hdiutil attach -readonly -nobrowse -owners on -mountpoint "$work/$2" "$1" | awk 'NR==1{print $1}')
-	devs+=("$dev")
+	hdiutil attach -readonly -nobrowse -owners on -mountpoint "$work/$2" "$1" >/dev/null
+	mounts+=("$work/$2")
 }
 attach_ro "$os" os
 attach_ro "$sysos" sysos
@@ -48,9 +49,11 @@ dev=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "$img" | a
 devs=("$dev" ${devs[@]+"${devs[@]}"})
 newfs_hfs -s -J -v iOSRoot "$dev"
 mkdir "$work/root"
-mount -t hfs "$dev" "$work/root"
-mounts+=("$work/root")
+# through Disk Arbitration: enableOwnership only works on volumes it mounted
+diskutil mount -mountPoint "$work/root" "$dev" >/dev/null
+mounts=("$work/root" ${mounts[@]+"${mounts[@]}"})
 diskutil enableOwnership "$work/root" >/dev/null
+diskutil info "$work/root" | grep -q "Owners: *Enabled" || { echo "ownership not enabled on $work/root" >&2; exit 1; }
 root=$work/root
 
 copy() {
@@ -103,8 +106,8 @@ python3 -I "$here/sweet-root-tweaks.py" "$root"
 
 stat -f '%Su:%Sg %N' "$root/sbin/launchd" "$root/private/var/mobile" "$db/diagnostics"
 df -h "$root"
-umount "$root"
-mounts=()
+diskutil unmount "$root" >/dev/null
+mounts=("${mounts[@]:1}")
 fsck_hfs -fn "$dev"
 hdiutil detach "$dev" >/dev/null
 devs=("${devs[@]:1}")
