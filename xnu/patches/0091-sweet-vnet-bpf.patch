@@ -1,0 +1,66 @@
+diff --git a/bsd/dev/sweet_vnet.c b/bsd/dev/sweet_vnet.c
+--- a/bsd/dev/sweet_vnet.c
++++ b/bsd/dev/sweet_vnet.c
+@@ -7,7 +7,10 @@
+  * device (ID 1), negotiates only VIRTIO_F_VERSION_1 and VIRTIO_NET_F_MAC
+  * (12-byte header, no offloads, one buffer per packet), and polls both rings
+  * from one thread. Frames go through ifnet_input / the ifnet output callback
+- * as in bsd/dev/sweet_usb.c. The address comes from configd (DHCP against
++ * as in bsd/dev/sweet_usb.c, and through BPF: iOS's DHCP client
++ * (IPConfiguration) sends and receives on /dev/bpf, which only works on an
++ * interface registered with bpfattach() that taps its traffic. The address
++ * comes from configd (DHCP against
+  * QEMU's -netdev user); for that SystemConfiguration needs an IOKit
+  * IONetworkInterface below a controller with IOMACAddress, which
+  * sweet_vnet_publish() (iokit/Kernel/arm/SweetNetworkStack.cpp) provides.
+@@ -37,6 +40,7 @@
+ #include <net/ether_if_module.h>
+ #include <net/kpi_interface.h>
+ #include <net/dlil.h>
++#include <net/bpf.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -110,6 +114,7 @@
+ 	uint8_t mac[ETHER_ADDR_LEN];
+ 	ifnet_t ifp;
+ 	lck_mtx_t *lock;                /* tx ring */
++	unsigned logged_rx, logged_tx;  /* first frames logged */
+ 	bool started;
+ } vn;
+ static int vnet_sleep_chan;
+@@ -244,8 +249,13 @@
+ 		unsigned slot = vn.tx_avail % QSIZE;
+ 		uint8_t *buf = (uint8_t *)(vn.dma + OFF_BUF(TXQ, slot));
+ 		struct vring_desc *desc = (struct vring_desc *)(vn.dma + OFF_RING(TXQ) + RING_DESC);
++		bpf_tap_out(ifp, DLT_EN10MB, m, NULL, 0);
+ 		bzero(buf, NET_HDR);
+ 		mbuf_copydata(m, 0, len, buf + NET_HDR);
++		if (vn.logged_tx < 8) {
++			vn.logged_tx++;
++			printf("SWEET VNET: tx %zu bytes type 0x%02x%02x\n", len, buf[NET_HDR + 12], buf[NET_HDR + 13]);
++		}
+ 		desc[slot].len = (uint32_t)(NET_HDR + len);
+ 		ring16(TXQ, RING_AVAIL)[2 + slot] = (uint16_t)slot;
+ 		__asm__ volatile("dmb ish" ::: "memory");
+@@ -283,6 +293,12 @@
+ 				memcpy(mbuf_data(m), (const void *)(vn.dma + OFF_BUF(RXQ, id) + NET_HDR), flen);
+ 				mbuf_setlen(m, flen);
+ 				mbuf_pkthdr_setlen(m, flen);
++				if (vn.logged_rx < 8) {
++					const uint8_t *f = mbuf_data(m);
++					vn.logged_rx++;
++					printf("SWEET VNET: rx %zu bytes type 0x%02x%02x\n", flen, f[12], f[13]);
++				}
++				bpf_tap_in(vn.ifp, DLT_EN10MB, m, NULL, 0);     /* the whole frame */
+ 				void *frame_header = mbuf_data(m);
+ 				mbuf_pkthdr_setrcvif(m, vn.ifp);
+ 				mbuf_pkthdr_setheader(m, frame_header);
+@@ -388,6 +404,7 @@
+ 		return ENXIO;
+ 	}
+ 	ifnet_set_lladdr(vn.ifp, vn.mac, ETHER_ADDR_LEN);
++	bpfattach(vn.ifp, DLT_EN10MB, sizeof(struct ether_header));
+ 	dlil_post_msg(vn.ifp, KEV_DL_SUBCLASS, KEV_DL_LINK_ON, NULL, 0, FALSE);
+ 	return 0;
+ }
