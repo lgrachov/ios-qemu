@@ -2,6 +2,13 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-21: QEMU live display + local harness (macOS host) <<<
+
+- Kernel built on a fork's Actions (`lgrachov/ios-sweet`, run `39652864254`, ~5 min, success) from main `425b251`; artifact in `xnu/out-local/kernel.development.sweet` (SHA256 matches SHA256SUMS).
+- `tools/qemu-sweet.py --display`: new stub `tools/qemu-ramfb-stub.S` (assembled with clang at run time) looks up `etc/ramfb` in fw_cfg and points ramfb at the 0x9c000000 1080x2400 framebuffer, then enters the kernel; QEMU opens a cocoa/gtk window showing the screen live. Verified headless: QMP screendump is 1080x2400 and shows the kernel console. Without --display the old 6-instruction stub and -nographic are unchanged (re-run OK).
+- `./harness.sh [--secs N] [--no-display] [--kernel PATH]`: rebuilds `research/qemu-local/q.adt` (`mkadt.py --qemu`) and payload (no RAM disk, no rd=) when stale, runs qemu-sweet with --display, output in `research/qemu-local/run-*`.
+- Observed: TCG boot (cortex-a76) gets only to network/skmem init in 150 s; `/product` missing (no `research/ipsw-x/d22ap.adt` on this host). Not tried yet: `-accel hvf -cpu host`, a root for QEMU (virtio-blk driver or large RAM disk).
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **STATE at end of 2026-10-18 (evening):**

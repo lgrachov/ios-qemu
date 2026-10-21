@@ -19,6 +19,10 @@ framebuffer using its iso_font into fb.txt and write result.json. This is a
 snapshot of the circular screen, not a complete boot log. --fail-on-panic
 returns 2 when a panic is visible; absence of a panic does not prove boot.
 An undecodable or blank screen returns 3 with --fail-on-panic.
+
+With --display, the stub (tools/qemu-ramfb-stub.S, assembled with clang)
+first points QEMU's ramfb device at the framebuffer, so a QEMU window shows
+the screen live while the guest runs.
 """
 import argparse, json, os, shutil, socket, struct, subprocess, sys, time, zlib
 
@@ -102,6 +106,36 @@ def build_image(payload):
 def stub(ba_pa, entry_pa):
     # ldr x0, =ba ; ldr x1, =entry ; br x1 ; nop ; .quad ba ; .quad entry
     return struct.pack('<4I2Q', 0x58000080, 0x580000a1, 0xd61f0020, 0xd503201f, ba_pa, entry_pa)
+
+
+def elf_section(obj, name):
+    """Contents of one section of an ELF64 little-endian object."""
+    assert obj[:4] == b'\x7fELF' and obj[4] == 2, 'not an ELF64 object'
+    shoff, = struct.unpack_from('<Q', obj, 0x28)
+    shentsize, shnum, shstrndx = struct.unpack_from('<3H', obj, 0x3a)
+    sections = [struct.unpack_from('<IIQQQQ', obj, shoff + i * shentsize) for i in range(shnum)]
+    strtab = sections[shstrndx][4]
+    for sh_name, _, _, _, offset, size in sections:
+        if obj[strtab + sh_name:obj.index(b'\0', strtab + sh_name)].decode() == name:
+            return obj[offset:offset + size]
+    raise ValueError(f'no {name} section')
+
+
+def ramfb_stub(ba_pa, entry_pa, out):
+    """Assemble tools/qemu-ramfb-stub.S: point ramfb at the framebuffer, then enter the kernel."""
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'qemu-ramfb-stub.S')
+    clang = ['xcrun', 'clang'] if sys.platform == 'darwin' else ['clang']
+    obj = f'{out}/ramfb-stub.o'
+    subprocess.check_call(clang + ['-target', 'aarch64-none-elf', '-c', src, '-o', obj,
+                                   f'-DBOOT_ARGS={ba_pa:#x}', f'-DENTRY={entry_pa:#x}',
+                                   f'-DFB_BASE={FB_BASE:#x}', f'-DFB_W={FB_W}', f'-DFB_H={FB_H}'])
+    data = open(obj, 'rb').read()
+    os.unlink(obj)
+    try:
+        elf_section(data, '.rela.text')
+    except ValueError:
+        return elf_section(data, '.text')
+    raise ValueError('ramfb stub has relocations; it must be position independent')
 
 
 def write_png(path, raw):
@@ -227,6 +261,7 @@ def main():
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
+    ap.add_argument('--display', action='store_true', help='show the framebuffer live in a QEMU window (ramfb; needs clang)')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     a = ap.parse_args()
 
@@ -264,7 +299,7 @@ def main():
 
     phys_base, img, ba_pa, entry_pa = build_image(payload)
     open(f'{out}/ram.bin', 'wb').write(img)
-    open(f'{out}/stub.bin', 'wb').write(stub(ba_pa, entry_pa))
+    open(f'{out}/stub.bin', 'wb').write(ramfb_stub(ba_pa, entry_pa, out) if a.display else stub(ba_pa, entry_pa))
     print(f'phys_base={phys_base:#x} boot_args={ba_pa:#x} entry={entry_pa:#x}', file=sys.stderr)
 
     mon = f'{out}/mon.sock'
@@ -274,11 +309,17 @@ def main():
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
     cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
-           '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
+           '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
+    if a.display:
+        # the 1080x2400 panel is taller than most screens; zoom-to-fit scales the window
+        backend = 'cocoa,zoom-to-fit=on' if sys.platform == 'darwin' else 'gtk,zoom-to-fit=on'
+        cmd += ['-device', 'ramfb', '-display', backend, '-monitor', 'none']
+    else:
+        cmd += ['-nographic']
     if a.gdb:
         cmd += ['-S', '-gdb', 'tcp::1234']
 

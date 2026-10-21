@@ -79,6 +79,15 @@ python3 tools/qemu-sweet.py /tmp/payload-qemu.bin /tmp/qemu_run \
     --fail-on-panic
 ```
 
+### Live Display Window
+Show the framebuffer live in a QEMU window (QEMU's `ramfb` device; the entry
+stub `tools/qemu-ramfb-stub.S` is assembled with clang at run time):
+```sh
+python3 tools/qemu-sweet.py /tmp/payload-qemu.bin /tmp/qemu_run --display --secs 150
+```
+`./harness.sh` does the ADT and payload steps for `xnu/out-local/kernel.development.sweet`
+and runs this (`./harness.sh --help`).
+
 ### Interactive GDB Debugging
 Start the machine halted with a GDB stub on port 1234:
 ```sh
