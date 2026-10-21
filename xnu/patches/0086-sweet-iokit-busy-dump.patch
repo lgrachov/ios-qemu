@@ -1,0 +1,64 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,7 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -79,4 +80,33 @@
+  * "compatible" string and "model" (D22AP / iPhone10,3 in the ADT), which
+  * is what the iPhone userland (MobileGestalt) expects.
+  */
++
++/*
++ * Services still busy (matching/starting/terminating). configd's
++ * InterfaceNamer waits for IOKit to go quiet before SystemConfiguration lists
++ * network interfaces; one service that never drops its busy count stalls
++ * every SCNetworkInterface caller until InterfaceNamer's timeout (Settings >
++ * General > About). Called by the process sampler (bsd/dev/sweet_sample.c).
++ */
++extern "C" void
++sweet_iokit_busy_dump(void)
++{
++	IORegistryIterator *iter = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
++	unsigned busy = 0;
++	if (iter == NULL) {
++		return;
++	}
++	while (IORegistryEntry *entry = iter->getNextObject()) {
++		IOService *service = OSDynamicCast(IOService, entry);
++		if (service != NULL && service->getBusyState() != 0) {
++			IORegistryEntry *parent = service->getParentEntry(gIOServicePlane);
++			IOLog("SWEET BUSY: %s (%s) busy %u, parent %s\n", service->getName(),
++			    service->getMetaClass()->getClassName(), service->getBusyState(),
++			    parent ? parent->getName() : "-");
++			busy++;
++		}
++	}
++	iter->release();
++	IOLog("SWEET BUSY: %u busy services\n", busy);
++}
+ #endif /* SWEET */
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -23,6 +23,7 @@
+ extern task_t proc_task(proc_t);
+ extern int hz;
+ extern void sweet_sample_start(void);
++extern void sweet_iokit_busy_dump(void);    /* iokit/Kernel/arm/SweetPlatformExpert.cpp */
+ 
+ static char sweet_sample_names[128];
+ 
+@@ -73,6 +74,7 @@
+ 	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
+ 	for (int i = 0; i < 40; i++) {
+ 		printf("SMP --- sample %d\n", i);
++		sweet_iokit_busy_dump();
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+ 		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
+ 	}
