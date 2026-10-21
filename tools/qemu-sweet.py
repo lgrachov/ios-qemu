@@ -261,6 +261,7 @@ def main():
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
+    ap.add_argument('--hvf', action='store_true', help='hardware virtualization on Apple Silicon (-accel hvf -cpu host); needs an ADT from mkadt.py --hvf')
     ap.add_argument('--display', action='store_true', help='show the framebuffer live in a QEMU window (ramfb; needs clang)')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     a = ap.parse_args()
@@ -308,7 +309,8 @@ def main():
     # virt RAM starts at 0x40000000: cover the payload's RAM (mkadt.py --highmem needs 8G).
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
-    cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
+    accel = ['-accel', 'hvf', '-cpu', 'host'] if a.hvf else ['-cpu', a.cpu]
+    cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', *accel, '-smp', '1', '-m', f'{ram_gib}G',
            '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
