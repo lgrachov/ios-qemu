@@ -1,0 +1,114 @@
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -367,6 +367,7 @@
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
+ private:
+ 	IOLock *fLock;
++	int fPanelW, fPanelH;                   /* the boot framebuffer (the panel) */
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+@@ -434,10 +435,23 @@
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	/*
++	 * Same rule as AppleCLCD::start (SweetFramebuffer.cpp): a panel that fits
++	 * in the iPhone X display is shown centered in it. The phone's 1080x2400
++	 * panel gets a 22,18 offset; QEMU's full 1125x2436 framebuffer none.
++	 */
++	PE_Video video;
++	PE_current_console(&video);
++	fPanelW = video.v_width ? (int)video.v_width : 1080;
++	fPanelH = video.v_height ? (int)video.v_height : 2400;
++	fLogicalW = fPanelW;
++	fLogicalH = fPanelH;
++	if (!native && fPanelW <= 1125 && fPanelH <= 2436) {
++		fLogicalW = 1125;
++		fLogicalH = 2436;
++	}
++	fOffX = (fLogicalW - fPanelW) / 2;
++	fOffY = (fLogicalH - fPanelH) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -458,8 +472,8 @@
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	x = x < 0 ? 0 : (x > fPanelW - 1 ? fPanelW - 1 : x);
++	y = y < 0 ? 0 : (y > fPanelH - 1 ? fPanelH - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+@@ -472,8 +486,8 @@
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > fPanelW - 1 - SWEET_TOUCH_EDGE_PX ||
++		    y < SWEET_TOUCH_EDGE_PX || y > fPanelH - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
+diff --git a/bsd/dev/sweet_vinput.c b/bsd/dev/sweet_vinput.c
+--- a/bsd/dev/sweet_vinput.c
++++ b/bsd/dev/sweet_vinput.c
+@@ -8,8 +8,8 @@
+  * the used ring from one thread; no interrupts.
+  *
+  *   virtio-tablet-device    BTN_LEFT/BTN_TOUCH + ABS_X/ABS_Y (0..32767 over the
+- *                           QEMU window) -> sweet_hid_touch(0, ...) in the
+- *                           1080x2400 panel pixels SweetHIDTouch expects
++ *                           QEMU window) -> sweet_hid_touch(0, ...) in panel
++ *                           pixels (the boot framebuffer's size)
+  *   virtio-keyboard-device  P power, H/Escape home, Up/Down volume
+  *                           -> sweet_hid_key()
+  *
+@@ -82,8 +82,6 @@
+ #define KEY_UP          103
+ #define KEY_DOWN        108
+ #define ABS_RANGE       32768
+-#define PANEL_W         1080
+-#define PANEL_H         2400
+ 
+ #define QSIZE           64u
+ #define MAX_DEVS        4u
+@@ -119,6 +117,7 @@
+ 	struct vinput_dev dev[MAX_DEVS];
+ 	unsigned ndev;
+ 	int abs_x, abs_y;
++	int panel_w, panel_h;
+ 	bool button, down;
+ 	bool started;
+ } vi;
+@@ -227,8 +226,8 @@
+ 		}
+ 		break;
+ 	case EV_SYN: {
+-		int x = (int)((int64_t)vi.abs_x * PANEL_W / ABS_RANGE);
+-		int y = (int)((int64_t)vi.abs_y * PANEL_H / ABS_RANGE);
++		int x = (int)((int64_t)vi.abs_x * vi.panel_w / ABS_RANGE);
++		int y = (int)((int64_t)vi.abs_y * vi.panel_h / ABS_RANGE);
+ 		if (vi.button) {
+ 			sweet_hid_touch(0, 1, x, y);    /* down or moved */
+ 			vi.down = true;
+@@ -275,6 +274,10 @@
+ {
+ 	(void)arg;
+ 	(void)result;
++	PE_Video video;
++	PE_current_console(&video);
++	vi.panel_w = video.v_width ? (int)video.v_width : 1080;
++	vi.panel_h = video.v_height ? (int)video.v_height : 2400;
+ 	vm_offset_t base = ml_io_map(VMMIO_PA, VMMIO_SLOTS * VMMIO_STRIDE);
+ 	for (unsigned slot = 0; slot < VMMIO_SLOTS && vi.ndev < MAX_DEVS; slot++) {
+ 		struct vinput_dev *d = &vi.dev[vi.ndev];
