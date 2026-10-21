@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--hvf] [--highmem]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--hvf] [--qemu-ufs] [--highmem]
 """
 import hashlib, os, struct, sys
 
@@ -33,6 +33,8 @@ SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
+# qemu-sweet.py --ufs: QEMU's UFSHCI PCI device, BAR set by its boot stub (UFS_BAR there)
+QEMU_UFS = 0x10000000
 TIMEBASE = 19200000
 VTIMER_INTID = 19
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
@@ -76,10 +78,11 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, hvf=False):
+def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
-    hvf=True (implies qemu): the host's counter frequency, for qemu-sweet.py --hvf."""
-    qemu = qemu or hvf
+    hvf=True (implies qemu): the host's counter frequency, for qemu-sweet.py --hvf.
+    qemu_ufs=True (implies qemu): /sweet-ufs at QEMU's UFS BAR, for qemu-sweet.py --ufs."""
+    qemu = qemu or hvf or qemu_ufs
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
@@ -207,7 +210,7 @@ def build(seed=None, qemu=False, highmem=False, hvf=False):
     ufs = node('sweet-ufs', [
         ph(),
         ('compatible', cstr('qcom,ufshc')),
-        ('reg', u64(UFS, UFS_SIZE)),
+        ('reg', u64(QEMU_UFS if qemu_ufs else UFS, UFS_SIZE)),
     ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
@@ -244,11 +247,12 @@ def build(seed=None, qemu=False, highmem=False, hvf=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([ufs] if qemu_ufs or not qemu else []))
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, hvf='--hvf' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, hvf='--hvf' in sys.argv,
+                 qemu_ufs='--qemu-ufs' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

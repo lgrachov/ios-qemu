@@ -12,6 +12,12 @@
  * directory; the stub looks up "etc/ramfb" and writes a RAMFBCfg to it.
  * All fw_cfg structures are big endian. If ramfb is absent the kernel
  * still boots, just without a live picture.
+ *
+ * With -DUFS_BAR=.. the stub also does the phone bootloader's part for
+ * bsd/dev/sweet_ufs.c, which expects an enabled UFSHCI host with the link
+ * up: it gives QEMU's "ufs" PCI device (00:UFS_SLOT.0 behind the low ECAM,
+ * -M virt,highmem-ecam=off) its BAR and bus mastering, sets HCE and runs
+ * DME_LINKSTARTUP. mkadt.py --qemu-ufs puts the same address in /sweet-ufs.
  */
 #define FW_CFG_BASE	0x09020000
 #define FW_CFG_FILE_DIR	0x19
@@ -26,9 +32,50 @@
 	.byte ((\v) >> 24) & 0xff, ((\v) >> 16) & 0xff, ((\v) >> 8) & 0xff, (\v) & 0xff
 .endm
 
+#define ECAM_BASE	0x3f000000	/* virt, highmem-ecam=off */
+#define UFS_VENDOR_DEV	0x00131b36	/* Red Hat 1b36, UFS 0013 */
+#define UFS_IS		0x20
+#define UFS_HCS		0x30
+#define UFS_HCE		0x34
+#define UFS_UICCMD	0x90
+#define UFS_UCMDARG1	0x94
+#define IS_UCCS		(1 << 10)
+#define HCS_UCRDY	(1 << 3)
+#define DME_LINKSTARTUP	0x16
+
 	.text
 	.globl _start
 _start:
+#ifdef UFS_BAR
+	ldr	x12, ufs_cfg
+	ldr	w1, [x12]			/* vendor/device: skip if not there */
+	ldr	w2, ufs_id
+	cmp	w1, w2
+	b.ne	ufs_done
+	ldr	x13, ufs_bar
+	str	w13, [x12, #0x10]		/* BAR0 (64-bit memory BAR) */
+	lsr	x1, x13, #32
+	str	w1, [x12, #0x14]
+	ldr	w1, [x12, #4]
+	orr	w1, w1, #6			/* memory space + bus master */
+	str	w1, [x12, #4]
+	mov	w1, #1
+	str	w1, [x13, #UFS_HCE]
+1:	ldr	w1, [x13, #UFS_HCE]
+	tbz	w1, #0, 1b
+2:	ldr	w1, [x13, #UFS_HCS]
+	tbz	w1, #3, 2b			/* HCS_UCRDY */
+	str	wzr, [x13, #UFS_UCMDARG1]
+	str	wzr, [x13, #UFS_UCMDARG1 + 4]
+	str	wzr, [x13, #UFS_UCMDARG1 + 8]
+	mov	w1, #DME_LINKSTARTUP
+	str	w1, [x13, #UFS_UICCMD]
+3:	ldr	w1, [x13, #UFS_IS]
+	tbz	w1, #10, 3b			/* IS_UCCS */
+	mov	w1, #IS_UCCS
+	str	w1, [x13, #UFS_IS]
+ufs_done:
+#endif
 	ldr	x9, fw_cfg
 	adr	x10, dma
 	adr	x11, dir
@@ -96,6 +143,12 @@ wait:
 fw_cfg:		.quad FW_CFG_BASE
 boot_args:	.quad BOOT_ARGS
 entry:		.quad ENTRY
+#ifdef UFS_BAR
+ufs_cfg:	.quad ECAM_BASE + (UFS_SLOT << 15)
+ufs_bar:	.quad UFS_BAR
+ufs_id:		.long UFS_VENDOR_DEV
+	.balign 8
+#endif
 cfg:		/* RAMFBCfg: be64 addr, be32 fourcc, flags, width, height, stride */
 	be32	(FB_BASE >> 32)
 	be32	(FB_BASE & 0xffffffff)

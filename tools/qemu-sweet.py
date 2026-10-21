@@ -30,6 +30,9 @@ FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400
 FB_STRIDE = FB_W * 4
 PAGE = 0x4000
 STUB_PA = 0x40200000	# above the dtb QEMU places at RAM base
+# --ufs: QEMU's UFSHCI at 00:UFS_SLOT.0, BAR at the start of virt's 32-bit PCI window
+# (mkadt.py QEMU_UFS must match)
+UFS_SLOT, UFS_BAR = 1, 0x10000000
 BOOT_LINE_LENGTH = 608
 
 
@@ -121,14 +124,16 @@ def elf_section(obj, name):
     raise ValueError(f'no {name} section')
 
 
-def ramfb_stub(ba_pa, entry_pa, out):
-    """Assemble tools/qemu-ramfb-stub.S: point ramfb at the framebuffer, then enter the kernel."""
+def ramfb_stub(ba_pa, entry_pa, out, ufs=False):
+    """Assemble tools/qemu-ramfb-stub.S: point ramfb at the framebuffer (and with ufs,
+    bring up the UFS host like the phone's bootloader), then enter the kernel."""
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'qemu-ramfb-stub.S')
     clang = ['xcrun', 'clang'] if sys.platform == 'darwin' else ['clang']
     obj = f'{out}/ramfb-stub.o'
     subprocess.check_call(clang + ['-target', 'aarch64-none-elf', '-c', src, '-o', obj,
                                    f'-DBOOT_ARGS={ba_pa:#x}', f'-DENTRY={entry_pa:#x}',
-                                   f'-DFB_BASE={FB_BASE:#x}', f'-DFB_W={FB_W}', f'-DFB_H={FB_H}'])
+                                   f'-DFB_BASE={FB_BASE:#x}', f'-DFB_W={FB_W}', f'-DFB_H={FB_H}']
+                          + ([f'-DUFS_BAR={UFS_BAR:#x}', f'-DUFS_SLOT={UFS_SLOT}'] if ufs else []))
     data = open(obj, 'rb').read()
     os.unlink(obj)
     try:
@@ -262,6 +267,7 @@ def main():
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
     ap.add_argument('--hvf', action='store_true', help='hardware virtualization on Apple Silicon (-accel hvf -cpu host); needs an ADT from mkadt.py --hvf')
+    ap.add_argument('--ufs', metavar='DISK', help='raw disk image (4 KiB-sector GPT, e.g. a "userdata" HFS+ partition) as a UFS LU; needs an ADT from mkadt.py --qemu-ufs and rd=ufsroot0')
     ap.add_argument('--display', action='store_true', help='show the framebuffer live in a QEMU window (ramfb; needs clang)')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     a = ap.parse_args()
@@ -300,7 +306,8 @@ def main():
 
     phys_base, img, ba_pa, entry_pa = build_image(payload)
     open(f'{out}/ram.bin', 'wb').write(img)
-    open(f'{out}/stub.bin', 'wb').write(ramfb_stub(ba_pa, entry_pa, out) if a.display else stub(ba_pa, entry_pa))
+    open(f'{out}/stub.bin', 'wb').write(ramfb_stub(ba_pa, entry_pa, out, ufs=bool(a.ufs))
+                                        if a.display or a.ufs else stub(ba_pa, entry_pa))
     print(f'phys_base={phys_base:#x} boot_args={ba_pa:#x} entry={entry_pa:#x}', file=sys.stderr)
 
     mon = f'{out}/mon.sock'
@@ -310,12 +317,16 @@ def main():
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
     accel = ['-accel', 'hvf', '-cpu', 'host'] if a.hvf else ['-cpu', a.cpu]
-    cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', *accel, '-smp', '1', '-m', f'{ram_gib}G',
+    machine = 'virt,gic-version=3' + (',highmem-ecam=off' if a.ufs else '')
+    cmd = ['qemu-system-aarch64', '-M', machine, *accel, '-smp', '1', '-m', f'{ram_gib}G',
            '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
+    if a.ufs:
+        cmd += ['-nic', 'none', '-drive', f'if=none,id=ufsdisk,format=raw,file={os.path.abspath(a.ufs)}',
+                '-device', f'ufs,id=ufs0,serial=sweet,addr={UFS_SLOT:#x}', '-device', 'ufs-lu,drive=ufsdisk,lun=0']
     if a.display:
         # the 1080x2400 panel is taller than most screens; zoom-to-fit scales the window
         backend = 'cocoa,zoom-to-fit=on' if sys.platform == 'darwin' else 'gtk,zoom-to-fit=on'

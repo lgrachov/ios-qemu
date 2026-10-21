@@ -2,12 +2,19 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
-### >>> UPDATE 2026-10-21: QEMU live display + local harness (macOS host) <<<
+### >>> UPDATE 2026-10-21: QEMU on a macOS host: live display, hvf, root over emulated UFS <<<
 
-- Kernel built on a fork's Actions (`lgrachov/ios-sweet`, run `39652864254`, ~5 min, success) from main `425b251`; artifact in `xnu/out-local/kernel.development.sweet` (SHA256 matches SHA256SUMS).
-- `tools/qemu-sweet.py --display`: new stub `tools/qemu-ramfb-stub.S` (assembled with clang at run time) looks up `etc/ramfb` in fw_cfg and points ramfb at the 0x9c000000 1080x2400 framebuffer, then enters the kernel; QEMU opens a cocoa/gtk window showing the screen live. Verified headless: QMP screendump is 1080x2400 and shows the kernel console. Without --display the old 6-instruction stub and -nographic are unchanged (re-run OK).
-- `./harness.sh [--secs N] [--no-display] [--kernel PATH]`: rebuilds `research/qemu-local/q.adt` (`mkadt.py --qemu`) and payload (no RAM disk, no rd=) when stale, runs qemu-sweet with --display, output in `research/qemu-local/run-*`.
-- Observed: TCG boot (cortex-a76) gets only to network/skmem init in 150 s; `/product` missing (no `research/ipsw-x/d22ap.adt` on this host). Not tried yet: `-accel hvf -cpu host`, a root for QEMU (virtio-blk driver or large RAM disk).
+- Kernels from the fork's Actions (`lgrachov/ios-sweet`): run `39652864254` (main `425b251`) -> `xnu/out-local` originally; `39657743158` (0082) -> `xnu/out-0082b`; `39662023034` (0083) -> `xnu/out-0083`, now also copied to `xnu/out-local` (harness default).
+- `qemu-sweet.py --display`: stub `tools/qemu-ramfb-stub.S` (clang at run time) points ramfb at the 0x9c000000 framebuffer via fw_cfg; live QEMU window. Verified by QMP screendump.
+- `--hvf` (`-accel hvf -cpu host`, ADT `mkadt.py --hvf` = 24 MHz host counter). First hvf boot halted after EARLY 8: lldb on QEMU's gdbstub (hw breakpoints work under hvf) showed a level-2 translation fault on the first write to the early-fb alias 0xfffffe0002000000, with page tables identical to TCG (stale walk cache from the bootstrap TTBR1). **0082** adds `dsb ishst; tlbi vmalle1is; dsb ish; isb` in sweet_early_relocate (first try used ';' -> only dsb emitted; Apple asm comment char again). Kernel phase timings hvf vs TCG: 0.017 s vs 0.168 s to PMRD, 0.037 vs 0.29 s after.
+- **0083**: IOKitInitializeTime no longer waits 30 s for IORTC (no RTC driver; phone also lost 30 s per boot). QEMU test init now runs ~5 s after start.
+- Screen console is a circular buffer: the tail of fb.txt is not the newest text. Use the msgbuf (`_msgbufp` -> struct msgbuf, `--hmp "memsave VA SIZE research/x.bin"`, no '-' in the path) for the real order.
+- **Root over emulated UFS, no new driver**: `qemu-sweet.py --ufs DISK` adds QEMU's `ufs` PCI device at 00:01.0 (`highmem-ecam=off`, `-nic none`) + `ufs-lu`; the stub (with -DUFS_BAR) assigns BAR0 0x10000000, enables bus mastering, sets HCE and runs DME_LINKSTARTUP (what ABL does on the phone). `mkadt.py --qemu-ufs` puts /sweet-ufs reg=0x10000000. `tools/mkufsdisk.py` writes the 4 KiB-sector GPT ("userdata", +8 MiB for the 0047 log). Verified with a 64 MB HFS+ test root (newfs_hfs, sweet-init as /sbin/launchd): `SWEET UFS: "userdata" on LUN 0` -> `BSD root: ufsroot0` -> init runs (`research/qemu-local/testdisk.img`).
+- RAM disk is not an option for the real root: mkpayload puts it inside the kernel's static region (highmem layout ~3.95 GiB total); the root is ~10.7 GiB uncompressed (OS 7.5, SystemOS 3.1 of which the shared cache is 3.1).
+- IPSW `research/ipsw/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw` (sha1 verified by ipsw); OS 087-86698-044.dmg, SystemOS 087-86593-047.dmg, AppOS 087-86715-047.dmg extracted to `research/ipsw/x/`. `research/ipsw-x/d22ap.adt` extracted (mkadt /product now present).
+- `tools/mkiosroot-mac.sh` (needs sudo + `brew install rsync`): macOS port of mkiosroot.sh + sweet-root-tweaks.py -> OUT/root.hfs + OUT/disk.img. NOT RUN YET.
+- `./harness.sh [--hvf] [--ios DISK]`: --ios uses the phone's boot-args with rd=ufsroot0 over emulated UFS.
+- NEXT: run mkiosroot-mac.sh, then `./harness.sh --ios research/iosroot/disk.img --secs 300` and follow launchd -> backboardd -> SpringBoard.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
