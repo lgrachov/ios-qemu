@@ -8,7 +8,8 @@
 # virtualization (its own ADT with the host timer frequency). --ios DISK boots
 # the iOS root on DISK (tools/mkiosroot-mac.sh disk.img) over emulated UFS with
 # the phone's boot-args (implies --hvf); click/drag in the window = touch,
-# keys P power, H/Esc home, Up/Down volume (patch 0084). Results (fb.png, fb.txt, result.json)
+# typing = a hardware keyboard, Ctrl+Option+P power, Ctrl+Option+H/Esc home,
+# Ctrl+Option+Up/Down volume (patches 0084, 0089). Results (fb.png, fb.txt, result.json)
 # go to research/qemu-local/run-<timestamp>/ (research/ is not in git).
 set -euo pipefail
 cd "$(dirname "$0")"

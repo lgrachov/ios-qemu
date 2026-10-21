@@ -3,7 +3,8 @@
 
   qemu-touch.py RUN_DIR tap X Y
   qemu-touch.py RUN_DIR swipe X1 Y1 X2 Y2 [MS]
-  qemu-touch.py RUN_DIR key power|home|volup|voldown [MS]
+  qemu-touch.py RUN_DIR key power|home|volup|voldown [MS]   (Ctrl+Option+key)
+  qemu-touch.py RUN_DIR type TEXT              (hardware keyboard, US layout)
   qemu-touch.py RUN_DIR unlock                 (swipe up from the bottom edge)
   qemu-touch.py RUN_DIR screenshot OUT.png
 
@@ -82,10 +83,29 @@ def main():
     elif cmd == 'unlock':
         swipe(q, PANEL_W / 2, PANEL_H - 10, PANEL_W / 2, PANEL_H * 0.35, 350)
     elif cmd == 'key':
-        k = {'type': 'qcode', 'data': KEYS[args[0]]}
-        q.events({'type': 'key', 'data': {'down': True, 'key': k}})
+        # buttons are Ctrl+Option(Alt)+key (patch 0089); bare keys are typing
+        keys = [{'type': 'qcode', 'data': c} for c in ('ctrl', 'alt', KEYS[args[0]])]
+        for k in keys:
+            q.events({'type': 'key', 'data': {'down': True, 'key': k}})
         time.sleep((float(args[1]) if len(args) > 1 else 100) / 1000)
-        q.events({'type': 'key', 'data': {'down': False, 'key': k}})
+        for k in reversed(keys):
+            q.events({'type': 'key', 'data': {'down': False, 'key': k}})
+    elif cmd == 'type':
+        # US layout: letters, digits, space and common punctuation
+        shifted = dict(zip('~!@#$%^&*()_+{}|:"<>?', '`1234567890-=[]\\;\',./'))
+        names = {' ': 'spc', '-': 'minus', '=': 'equal', '[': 'bracket_left', ']': 'bracket_right',
+                 '\\': 'backslash', ';': 'semicolon', "'": 'apostrophe', '`': 'grave_accent',
+                 ',': 'comma', '.': 'dot', '/': 'slash', '\n': 'ret'}
+        for ch in ' '.join(args):
+            base = shifted.get(ch, ch.lower())
+            shift = ch in shifted or ch.isupper()
+            code = {'type': 'qcode', 'data': names.get(base, base)}
+            seq = ([{'type': 'qcode', 'data': 'shift'}] if shift else []) + [code]
+            for k in seq:
+                q.events({'type': 'key', 'data': {'down': True, 'key': k}})
+            for k in reversed(seq):
+                q.events({'type': 'key', 'data': {'down': False, 'key': k}})
+            time.sleep(0.03)
     elif cmd == 'screenshot':
         # PNG: QEMU's PPM screendump shears odd widths (rows padded to 4 bytes)
         q.call('screendump', filename=os.path.abspath(args[0]), format='png')
