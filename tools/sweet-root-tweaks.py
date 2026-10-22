@@ -15,8 +15,10 @@ screen (image versions v8-v14 in NOTES.md):
                   crash-loops and Setup blocks on its CoreTelephony XPC)
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
-  migration       LastSystemVersion so DataMigration does not run for an hour
-                  on every boot
+  migration       DMUserDataDisposition only. LastSystemVersion is left to
+                  datamigrator: the first boot migrates (~1 min under QEMU
+                  with kernel 0098 and the mkadt MACs) and SystemAppMigrator
+                  installs the staged apps (Mail, Notes, Clock, ...)
   audio           VirtualAudio HAL plug-in disabled (mediaserverd crash)
   MediaToolbox    StartRecorderServer=false (camera filter prewarm calls a
                   NULL OpenGL function without a GPU -> mediaserverd crash loop)
@@ -152,7 +154,6 @@ def main():
     activation(root)
     audio(root)
     merge_pref(root, 'com.apple.migration', {
-        'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
     merge_pref(root, 'com.apple.springboard', {
         'BKNoWatchdogs': True,
