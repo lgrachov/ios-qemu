@@ -1,0 +1,47 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 3a9d019..90bcb64 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -405,9 +405,23 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+  * unreadable. SWEET's signature policy already permits everything, so this
+  * reports enforcement disabled (0x86) to match reality. Every other call keeps
+  * returning ENOPOLICY, so nothing but this query changes.
++ *
++ * Call 0x5a is dyld's amfi_check_dyld_policy_self(): arg points to
++ * { u64 input flags, u64 *output flags }; the output bits are what dyld may do
++ * for this process (dyld4 ProcessConfig::Security, bit 0 @-path expansion,
++ * 1 DYLD_* path variables, 2 custom shared cache, 3 classic fallback paths,
++ * 4 printing variables, 5 failed insertions, 6 interposing, 7 embedded
++ * variables). Unanswered, dyld uses 0: system binaries are fine, but apps
++ * with embedded frameworks die with "Library not loaded: @rpath/...
++ * (security policy does not allow @ path expansion)". SWEET answers 0x9,
++ * @-paths and fallback paths, as for a normal third-party app; DYLD_*
++ * variables and interposing stay off as before.
+  */
+ #define SWEET_AMFI_QUERY_BOOTARG_STATE          0x60
+ #define SWEET_AMFI_BOOTARG_ENFORCEMENT_OFF      0x86ULL
++#define SWEET_AMFI_DYLD_POLICY                  0x5a
++#define SWEET_AMFI_DYLD_ALLOW_AT_PATH           0x1ULL
++#define SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS    0x8ULL
+ 
+ static int
+ sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
+@@ -416,6 +430,18 @@ sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
+ 		uint64_t state = SWEET_AMFI_BOOTARG_ENFORCEMENT_OFF;
+ 		return copyout(&state, arg, sizeof(state));
+ 	}
++	if (call == SWEET_AMFI_DYLD_POLICY) {
++		struct {
++			uint64_t      input;
++			user64_addr_t output;
++		} args;
++		int error = copyin(arg, &args, sizeof(args));
++		if (error) {
++			return error;
++		}
++		uint64_t policy = SWEET_AMFI_DYLD_ALLOW_AT_PATH | SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS;
++		return copyout(&policy, args.output, sizeof(policy));
++	}
+ 	return ENOPOLICY;
+ }
+ 
