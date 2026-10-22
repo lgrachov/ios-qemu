@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--hvf] [--qemu-ufs] [--qemu-fullfb] [--highmem]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--hvf] [--qemu-ufs] [--qemu-fullfb] [--highmem] [--cpus N]
 """
 import hashlib, os, struct, sys
 
@@ -83,11 +83,12 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False, qemu_fullfb=False):
+def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False, qemu_fullfb=False, qemu_cpus=1):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     hvf=True (implies qemu): the host's counter frequency, for qemu-sweet.py --hvf.
     qemu_ufs=True (implies qemu): /sweet-ufs at QEMU's UFS BAR, for qemu-sweet.py --ufs.
-    qemu_fullfb=True (implies qemu): a 1125x2436 sweet-fbcon, for qemu-sweet.py --fullfb."""
+    qemu_fullfb=True (implies qemu): a 1125x2436 sweet-fbcon, for qemu-sweet.py --fullfb.
+    qemu_cpus=N: N CPU nodes with QEMU virt's MPIDRs, for qemu-sweet.py --smp N (kernel cpus=N)."""
     qemu = qemu or hvf or qemu_ufs or qemu_fullfb
     fb_w, fb_h, fb_stride = QEMU_FULL_FB if qemu_fullfb else (FB_W, FB_H, FB_STRIDE)
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
@@ -148,14 +149,14 @@ def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False, qemu_
     # SWEET SMP: all eight cores in physical-core order (0-5 Cortex-A55,
     # 6-7 Cortex-A76), one homogeneous cluster. The kernel defaults to one
     # and uses cpus=N to select an initial prefix (N <= 8).
-    # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
+    # QEMU (--cpus N, qemu-sweet.py --smp N): virt numbers vCPUs in MPIDR Aff0.
     cpu_nodes = []
-    for core in range(1 if qemu else 8):
+    for core in range(qemu_cpus if qemu else 8):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
-            ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            ('reg', u32(core if qemu else core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
@@ -171,8 +172,9 @@ def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False, qemu_
             ('peripheral-frequency', u32(timebase)),
             ('fixed-frequency', u32(timebase)),
         ]))
+    # PSCI CPU_ON: QEMU virt under hvf only answers hvc (SweetCPU, patch 0097).
     cpus = node('cpus', [ph(), ('#address-cells', u32(1)),
-                         ('#size-cells', u32(0))], cpu_nodes)
+                         ('#size-cells', u32(0))] + ([('psci-conduit', cstr('hvc'))] if qemu else []), cpu_nodes)
 
     gic = node('gic', [
         ph(),
@@ -271,7 +273,8 @@ def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False, qemu_
 
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, hvf='--hvf' in sys.argv,
-                 qemu_ufs='--qemu-ufs' in sys.argv, qemu_fullfb='--qemu-fullfb' in sys.argv)
+                 qemu_ufs='--qemu-ufs' in sys.argv, qemu_fullfb='--qemu-fullfb' in sys.argv,
+                 qemu_cpus=int(sys.argv[sys.argv.index('--cpus') + 1]) if '--cpus' in sys.argv else 1)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

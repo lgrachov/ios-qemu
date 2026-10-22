@@ -1,0 +1,73 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..eb8d82c 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -17,6 +17,7 @@
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+@@ -24,6 +25,9 @@ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+ static uint32_t sweet_cpus_registered;
++/* PSCI conduit: smc to the phone's EL3 firmware; hvc under QEMU/hvf, whose virt
++ * board only answers hvc (ADT /cpus "psci-conduit" = "hvc", mkadt.py --qemu*). */
++static bool sweet_psci_hvc;
+ 
+ /* SMCCC 1.0: x0 is the signed PSCI result; do not assume x1-x17 survive. */
+ static int32_t
+@@ -33,9 +37,15 @@ sweet_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
+ 	register uint64_t x1 __asm__("x1") = target;
+ 	register uint64_t x2 __asm__("x2") = entry;
+ 	register uint64_t x3 __asm__("x3") = context;
+-	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
+-	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+-	    "x14", "x15", "x16", "x17", "cc", "memory");
++	if (sweet_psci_hvc) {
++		__asm__ volatile("hvc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++		    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++		    "x14", "x15", "x16", "x17", "cc", "memory");
++	} else {
++		__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++		    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++		    "x14", "x15", "x16", "x17", "cc", "memory");
++	}
+ 	return (int32_t)x0;
+ }
+ 
+@@ -73,9 +83,11 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+-	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++	/* MPIDR: sweet has the core in Aff1 (0x000-0x500 A55, 0x600/0x700 A76);
++	 * QEMU virt numbers vCPUs in Aff0 (0-15 with GICv3). */
++	bool phone_mpidr = cpu->phys_id <= 0x700 && (cpu->phys_id & 0xff) == 0;
++	bool qemu_mpidr = cpu->phys_id < 16;
++	if ((!phone_mpidr && !qemu_mpidr) || topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
+@@ -127,7 +139,16 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ {
+ 	const ml_topology_info_t *topology = ml_get_topology_info();
+ 	uint32_t requested = 1;
++	DTEntry node;
++	void const *conduit = NULL;
++	unsigned int size = 0;
+ 	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
++	if (SecureDTLookupEntry(NULL, "/cpus", &node) == kSuccess &&
++	    SecureDTGetProperty(node, "psci-conduit", &conduit, &size) == kSuccess &&
++	    size >= 4 && strncmp((const char *)conduit, "hvc", 4) == 0) {
++		sweet_psci_hvc = true;
++	}
++	IOLog("SWEET CPU: PSCI conduit %s\n", sweet_psci_hvc ? "hvc" : "smc");
+ 	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
+ 	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
+ 
