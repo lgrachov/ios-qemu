@@ -18,7 +18,7 @@ This is not Corellium. Corellium boots Apple's own iOS kernel on virtual hardwar
 | Storage | iOS root on a journaled HFS+ volume behind QEMU's emulated UFS controller, read/write |
 | iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache |
 | Display | 1125×2436 in a live QEMU window (ramfb). Kernel IOSurface and IOMobileFramebuffer (`AppleCLCD`) services; CoreAnimation renders on the CPU |
-| GUI | Lock screen, home screen, Settings (About, Date & Time), Safari |
+| GUI | Lock screen with wallpaper, home screen with widgets, the stock apps (Mail, Notes, Calendar, Clock, Maps, …), Settings, Safari |
 | Touch | Mouse clicks and drags in the window (virtio-tablet → HID digitizer) |
 | Keyboard | Attached hardware keyboard (virtio-keyboard → HID). Ctrl+Option+P power, Ctrl+Option+H or Esc home, Ctrl+Option+Up/Down volume |
 | Network | virtio-net as `en0` on QEMU user networking: DHCP, DNS, TCP, QUIC, HTTP and HTTPS in Safari |
@@ -28,7 +28,7 @@ This is not Corellium. Corellium boots Apple's own iOS kernel on virtual hardwar
 
 ## What does not work (yet)
 
-- **No wallpaper** (PosterBoard crashes), and some daemons (bluetoothd, fairplayd, assetsd) keep restarting.
+- **Default wallpaper:** a plain blue fallback instead of iOS 16's default, because sandbox extensions are not issued yet. Some daemons (bluetoothd, assetsd) keep restarting.
 - No GPU, no audio, camera, Bluetooth, cellular, location or Face ID.
 - **Security is off:** permissive code signing (AMFI) and Sandbox policies, a stub AppleKeyStore, no data protection.
 

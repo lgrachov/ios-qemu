@@ -51,8 +51,10 @@ ADT_ARGS="--qemu $HVF" QEMU_ARGS=()
 if [ -n "$IOS_DISK" ]; then
 	[ -f "$IOS_DISK" ] || { echo "no disk image at $IOS_DISK" >&2; exit 1; }
 	ADT=$W/q-ios.adt PAYLOAD=$W/payload-ios.bin ADT_ARGS="--hvf --qemu-ufs --qemu-fullfb --highmem" QEMU_ARGS=(--ufs "$IOS_DISK" --fullfb)
-	# the phone's boot-args (NOTES.md); cpus= follows --cpus
-	CMDLINE="$CMDLINE rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetvinput=1 sweetvnet=1 sweettouch=0"
+	# the phone's boot-args (NOTES.md); cpus= follows --cpus. ml-timeout-global-scale:
+	# hardware lock/spin timeouts x20, a vCPU can stall while the host runs
+	# something else (pset lock "Ticket spinlock timeout" panic under load).
+	CMDLINE="$CMDLINE rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetvinput=1 sweetvnet=1 sweettouch=0 ml-timeout-global-scale=20"
 fi
 [ -n "$CPUS" ] || { [ -n "$IOS_DISK" ] && CPUS=4 || CPUS=1; }
 ADT_ARGS="$ADT_ARGS --cpus $CPUS" CMDLINE=${CMDLINE/cpus=1/cpus=$CPUS}
