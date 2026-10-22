@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Boot the local kernel in QEMU with a live display window.
 #
-#   ./harness.sh [--secs N] [--no-display] [--no-log] [--hvf] [--ios DISK] [--cpus N] [--bootargs "..."] [--kernel PATH] [-- extra qemu-sweet.py args]
+#   ./harness.sh [--secs N] [--no-display] [--no-log] [--hvf] [--ios DISK] [--cpus N] [--serial S] [--bootargs "..."] [--kernel PATH] [-- extra qemu-sweet.py args]
 #
 # Runs until the QEMU window is closed, the guest powers off or Ctrl-C (which
 # still saves the screen); --secs N stops after N seconds instead.
@@ -12,7 +12,8 @@
 # the phone's boot-args (implies --hvf); click/drag in the window = touch,
 # typing = a hardware keyboard, Ctrl+Option+P power, Ctrl+Option+H/Esc home,
 # Ctrl+Option+Up/Down volume (patches 0084, 0089). --cpus N: vCPUs (default 4
-# with --ios, else 1; the kernel needs 0097 for N > 1). The kernel log streams to
+# with --ios, else 1; the kernel needs 0097 for N > 1). --serial S: the
+# device serial number (default QEMU00000001, tools/mkadt.py). The kernel log streams to
 # the terminal (qemu-sweet.py --live-log; --no-log turns it off). Results (fb.png, fb.txt, result.json)
 # go to research/qemu-local/run-<timestamp>/ (research/ is not in git).
 set -euo pipefail
@@ -28,6 +29,7 @@ CPUS=
 CMDLINE='debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress'
 EXTRA=()
 MORE_ARGS=
+SERIAL=
 
 while [ $# -gt 0 ]; do
 	case $1 in
@@ -35,6 +37,7 @@ while [ $# -gt 0 ]; do
 	--kernel) KERNEL=$2; shift 2 ;;
 	--bootargs) MORE_ARGS=$2; shift 2 ;;
 	--cpus) CPUS=$2; shift 2 ;;
+	--serial) SERIAL=$2; shift 2 ;;
 	--no-display) DISPLAY_ARG=; shift ;;
 	--no-log) LOG_ARG=; shift ;;
 	--hvf) HVF=--hvf; shift ;;
@@ -60,6 +63,7 @@ if [ -n "$IOS_DISK" ]; then
 fi
 [ -n "$CPUS" ] || { [ -n "$IOS_DISK" ] && CPUS=4 || CPUS=1; }
 ADT_ARGS="$ADT_ARGS --cpus $CPUS" CMDLINE=${CMDLINE/cpus=1/cpus=$CPUS}
+[ -z "$SERIAL" ] || ADT_ARGS="$ADT_ARGS --serial $SERIAL"
 QEMU_ARGS+=(--smp "$CPUS")
 mkdir -p "$W"
 [ -z "$MORE_ARGS" ] || CMDLINE="$CMDLINE $MORE_ARGS"

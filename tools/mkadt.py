@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--hvf] [--qemu-ufs] [--qemu-fullfb] [--highmem] [--cpus N]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--hvf] [--qemu-ufs] [--qemu-fullfb] [--highmem] [--cpus N] [--serial S]
 """
 import hashlib, os, struct, sys
 
@@ -29,7 +29,12 @@ SOC_BASE = 0x01000000
 GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
 FB, FB_SIZE = 0x9c000000, 0x1700000
-SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
+SWEET_ECID = 0x51454d5500000001  # 'QEMU' + 1, synthetic
+# Factory identity (syscfg SrNm/Mod#/Regn/MLB#), synthetic serials: a silver
+# 64 GB iPhone X, iPhone10,3 = A1865, part number MQA62LL/A (Mod# + Regn).
+SERIAL = 'QEMU00000001'
+MLB_SERIAL = 'QEMUMLB000000001'
+MODEL_NUMBER, REGION_INFO = 'MQA62', 'LL/A'
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # QEMU (qemu-sweet.py --fullfb): the whole presented iPhone X display, no crop.
 # Unpadded rows (iOS pads its own surfaces to 4608; nothing needs it here).
@@ -74,6 +79,7 @@ def d22ap_product(path=D22AP_ADT):
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
+syscfg_str = lambda s: s.encode().ljust(0x20, b'\0')[:0x20]
 
 
 def node(name, props=(), children=()):
@@ -83,7 +89,8 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False, qemu_fullfb=False, qemu_cpus=1):
+def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False, qemu_fullfb=False, qemu_cpus=1,
+          serial=SERIAL):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     hvf=True (implies qemu): the host's counter frequency, for qemu-sweet.py --hvf.
     qemu_ufs=True (implies qemu): /sweet-ufs at QEMU's UFS BAR, for qemu-sweet.py --ufs.
@@ -271,6 +278,13 @@ def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False, qemu_
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
+        # iBoot fills these from syscfg as 0x20-byte zero-padded strings
+        # (placeholders like syscfg/SrNm/0x20,zeroes/0x20 in the D22AP tree);
+        # without them iOS has no serial or model number (Settings > About).
+        ('serial-number', syscfg_str(serial)),
+        ('mlb-serial-number', syscfg_str(MLB_SERIAL)),
+        ('model-number', syscfg_str(MODEL_NUMBER)),
+        ('region-info', syscfg_str(REGION_INFO)),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
@@ -280,7 +294,8 @@ def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False, qemu_
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, hvf='--hvf' in sys.argv,
                  qemu_ufs='--qemu-ufs' in sys.argv, qemu_fullfb='--qemu-fullfb' in sys.argv,
-                 qemu_cpus=int(sys.argv[sys.argv.index('--cpus') + 1]) if '--cpus' in sys.argv else 1)
+                 qemu_cpus=int(sys.argv[sys.argv.index('--cpus') + 1]) if '--cpus' in sys.argv else 1,
+                 serial=sys.argv[sys.argv.index('--serial') + 1] if '--serial' in sys.argv else SERIAL)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
