@@ -1,4 +1,6 @@
-# iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
+# ios-qemu (iOS 16 in QEMU) - working notes
+
+**2026-10-22: project rebranded to ios-qemu (user decision).** Goal is now iOS 16.7 in QEMU/hvf on Apple Silicon; the phone is no longer a target (code kept, docs dropped: README rewritten, `site/` for hackiosx.dev removed from the repo; the live site is on Cloudflare and was not touched). Everything below about the phone is history.
 
 ## Agent handoff / active work (2026-10-15, latest)
 
