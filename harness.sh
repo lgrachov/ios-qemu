@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Boot the local kernel in QEMU with a live display window.
 #
-#   ./harness.sh [--secs N] [--no-display] [--hvf] [--ios DISK] [--cpus N] [--bootargs "..."] [--kernel PATH] [-- extra qemu-sweet.py args]
+#   ./harness.sh [--secs N] [--no-display] [--no-log] [--hvf] [--ios DISK] [--cpus N] [--bootargs "..."] [--kernel PATH] [-- extra qemu-sweet.py args]
 #
 # Rebuilds the QEMU ADT and payload when they are missing or older than the
 # kernel, then runs tools/qemu-sweet.py. --hvf uses Apple Silicon hardware
@@ -10,7 +10,8 @@
 # the phone's boot-args (implies --hvf); click/drag in the window = touch,
 # typing = a hardware keyboard, Ctrl+Option+P power, Ctrl+Option+H/Esc home,
 # Ctrl+Option+Up/Down volume (patches 0084, 0089). --cpus N: vCPUs (default 4
-# with --ios, else 1; the kernel needs 0097 for N > 1). Results (fb.png, fb.txt, result.json)
+# with --ios, else 1; the kernel needs 0097 for N > 1). The kernel log streams to
+# the terminal (qemu-sweet.py --live-log; --no-log turns it off). Results (fb.png, fb.txt, result.json)
 # go to research/qemu-local/run-<timestamp>/ (research/ is not in git).
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -18,6 +19,7 @@ cd "$(dirname "$0")"
 KERNEL=xnu/out-local/kernel.development.sweet
 SECS=150
 DISPLAY_ARG=--display
+LOG_ARG=--live-log
 HVF=
 IOS_DISK=
 CPUS=
@@ -32,10 +34,11 @@ while [ $# -gt 0 ]; do
 	--bootargs) MORE_ARGS=$2; shift 2 ;;
 	--cpus) CPUS=$2; shift 2 ;;
 	--no-display) DISPLAY_ARG=; shift ;;
+	--no-log) LOG_ARG=; shift ;;
 	--hvf) HVF=--hvf; shift ;;
 	--ios) IOS_DISK=$2; HVF=--hvf; shift 2 ;;
 	--) shift; EXTRA=("$@"); break ;;
-	-h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+	-h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 	*) echo "unknown option: $1 (see --help)" >&2; exit 1 ;;
 	esac
 done
@@ -75,4 +78,4 @@ done
 OUT=$W/run-$(date +%Y%m%d-%H%M%S)
 echo "running $KERNEL for ${SECS}s -> $OUT"
 python3 tools/qemu-sweet.py "$PAYLOAD" "$OUT" --secs "$SECS" --kernel "$KERNEL" \
-	$DISPLAY_ARG $HVF ${QEMU_ARGS[@]+"${QEMU_ARGS[@]}"} ${EXTRA[@]+"${EXTRA[@]}"}
+	$DISPLAY_ARG $LOG_ARG $HVF ${QEMU_ARGS[@]+"${QEMU_ARGS[@]}"} ${EXTRA[@]+"${EXTRA[@]}"}

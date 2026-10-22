@@ -24,7 +24,7 @@ With --display, the stub (tools/qemu-ramfb-stub.S, assembled with clang)
 first points QEMU's ramfb device at the framebuffer, so a QEMU window shows
 the screen live while the guest runs.
 """
-import argparse, json, os, shutil, socket, struct, subprocess, sys, time, zlib
+import argparse, json, os, re, shutil, socket, struct, subprocess, sys, time, zlib
 
 FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400
 FB_STRIDE = FB_W * 4
@@ -247,6 +247,79 @@ def stream_serial_file(serial_path, file_pos, out_stream=sys.stdout):
     return file_pos
 
 
+class MsgbufStream:
+    """--live-log: print the kernel message buffer as it grows. The kernel has
+    no UART driver (serial.txt stays empty); this follows struct msgbuf
+    (magic/size, bufx/bufr, bufc) through its own QMP socket (log.sock), so
+    qemu-touch.py and qemu-klog.py keep mon.sock (QMP is single-client)."""
+
+    def __init__(self, sock, kernel, part, stream=sys.stdout):
+        self.sock_path, self.part, self.stream = sock, os.path.abspath(part), stream
+        self.msgbufp = None
+        for line in subprocess.run(['llvm-nm', kernel], capture_output=True, text=True).stdout.splitlines():
+            f = line.split()
+            if len(f) == 3 and f[2] == '_msgbufp':
+                self.msgbufp = int(f[0], 16)
+        self.f = None
+        self.pos = None
+
+    def hmp(self, command):
+        self.f.write(json.dumps({'execute': 'human-monitor-command',
+                                 'arguments': {'command-line': command}}) + '\n')
+        self.f.flush()
+        while True:
+            r = json.loads(self.f.readline())
+            if 'error' in r:
+                raise RuntimeError(r['error'])
+            if 'return' in r:
+                return r['return']
+
+    def quads(self, addr, n):
+        t = self.hmp(f'x /{n}gx {addr:#x}')
+        v = [int(x, 16) for line in t.splitlines() if ':' in line
+             for x in re.findall(r'0x[0-9a-f]+', line.split(':', 1)[1])]
+        if len(v) < n:
+            raise ValueError(t.strip())
+        return v
+
+    def copy(self, addr, size):
+        self.hmp(f'memsave {addr:#x} {size} "{self.part}"')
+        with open(self.part, 'rb') as fh:
+            return fh.read()
+
+    def poll(self):
+        if self.msgbufp is None:
+            return
+        try:
+            if self.f is None:
+                s = socket.socket(socket.AF_UNIX)
+                s.connect(self.sock_path)
+                self.f = s.makefile('rw')
+                self.f.readline()
+                self.f.write(json.dumps({'execute': 'qmp_capabilities'}) + '\n')
+                self.f.flush()
+                self.f.readline()
+            mb = self.quads(self.msgbufp, 1)[0]
+            magic_size, bufx_bufr, bufc = self.quads(mb, 3)
+            size, bufx = magic_size >> 32, bufx_bufr & 0xffffffff
+            if not mb or not bufc or not 0 < size <= 1 << 24 or bufx >= size:
+                return		# not set up yet
+            if self.pos is None:	# first look: everything so far, oldest first
+                data = self.copy(bufc, size)
+                data = data[bufx:] + data[:bufx]
+            elif bufx == self.pos:
+                return
+            elif bufx > self.pos:
+                data = self.copy(bufc + self.pos, bufx - self.pos)
+            else:			# wrapped
+                data = self.copy(bufc + self.pos, size - self.pos) + (self.copy(bufc, bufx) if bufx else b'')
+            self.pos = bufx
+            self.stream.write(data.replace(b'\0', b'').decode('utf-8', 'replace'))
+            self.stream.flush()
+        except (OSError, ValueError, RuntimeError, json.JSONDecodeError):
+            pass		# early boot (no MMU mapping yet) or QEMU going away
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Boot a SWEETXNU payload in QEMU's virt board.",
@@ -266,6 +339,7 @@ def main():
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
+    ap.add_argument('--live-log', action='store_true', help='stream the kernel message buffer to stdout (needs --kernel; own QMP socket log.sock)')
     ap.add_argument('--lockdown-port', type=int, default=62078, metavar='PORT',
                     help='with --ufs: forward host 127.0.0.1:PORT to the guest lockdownd (62078); 0 = off')
     ap.add_argument('--smp', type=int, default=1, help='vCPUs (secondaries start powered off for PSCI CPU_ON); needs an ADT from mkadt.py --cpus N')
@@ -318,8 +392,9 @@ def main():
     print(f'phys_base={phys_base:#x} boot_args={ba_pa:#x} entry={entry_pa:#x}', file=sys.stderr)
 
     mon = f'{out}/mon.sock'
-    if os.path.exists(mon):
-        os.unlink(mon)
+    for sock in (mon, f'{out}/log.sock'):
+        if os.path.exists(sock):
+            os.unlink(sock)
     # virt RAM starts at 0x40000000: cover the payload's RAM (mkadt.py --highmem needs 8G).
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
@@ -327,6 +402,7 @@ def main():
     machine = 'virt,gic-version=3' + (',highmem-ecam=off' if a.ufs else '')
     cmd = ['qemu-system-aarch64', '-M', machine, *accel, '-smp', str(a.smp), '-m', f'{ram_gib}G',
            '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
+           '-qmp', f'unix:{out}/log.sock,server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
@@ -354,6 +430,7 @@ def main():
     p = None
     serial_file = f'{out}/serial.txt'
     serial_pos = 0
+    live_log = MsgbufStream(f'{out}/log.sock', a.kernel, f'{out}/msgbuf.part') if a.live_log and a.kernel else None
 
     try:
         p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
@@ -366,6 +443,8 @@ def main():
         while p.poll() is None and time.time() - t0 < a.secs:
             if a.live_serial:
                 serial_pos = stream_serial_file(serial_file, serial_pos)
+            if live_log:
+                live_log.poll()
             time.sleep(0.2)
 
         if a.live_serial:
