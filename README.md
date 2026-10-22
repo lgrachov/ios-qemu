@@ -112,7 +112,7 @@ Not in git: Apple firmware, IPSWs, root images, shared caches and generated buil
 
 ## Legal
 
-iOS, iPhone and Apple are trademarks of Apple Inc. This project is not affiliated with or endorsed by Apple. It contains no Apple binaries: you supply the IPSW, and Apple's software licence terms for it apply to you. The kernel patches modify Apple's open-source XNU and are distributed under the [Apple Public Source License 2.0](https://opensource.apple.com/license/apsl/).
+iOS, iPhone and Apple are trademarks of Apple Inc. This project is not affiliated with or endorsed by Apple. It contains no Apple binaries: you supply the IPSW, and Apple's software licence terms for it apply to you. The project's own code (tools, scripts, documentation) is under the MIT License, see [`LICENSE`](LICENSE). The kernel patches modify Apple's open-source XNU and are also subject to the [Apple Public Source License 2.0](https://opensource.apple.com/license/apsl/).
 
 ## Credits
 
