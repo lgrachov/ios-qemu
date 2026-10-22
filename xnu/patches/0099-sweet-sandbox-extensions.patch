@@ -1,0 +1,128 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index dfeec5e..3a9d019 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -24,7 +24,9 @@
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <kern/debug.h>
++#include <kern/kalloc.h>
+ #include <kern/startup.h>
++#include <libkern/OSAtomic.h>
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
+@@ -279,14 +281,96 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  * launchd reports mach lookups as "error = 159: Sandbox restriction"
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). SWEET runs without a sandbox: operations succeed
+- * (checks allow, profile init is accepted); the few that must return
+- * data (container paths, extension tokens) fail with ENOENT. The first
+- * use of each operation number is logged.
++ * (checks allow, profile init is accepted); extensions are issued and
++ * consumed (below); container paths fail with ENOENT. The first use of
++ * each operation number is logged.
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
++/*
++ * Sandbox extensions, ABI of iOS 16.7 libsystem_sandbox:
++ * op 5 (_sandbox_extension_issue, behind sandbox_extension_issue_file/
++ * _mach/_generic/..._to_process) passes struct sweet_sandbox_issue_args;
++ * the kernel writes a NUL-terminated token into the caller's malloc(2048)
++ * buffer. op 6 (sandbox_extension_consume) passes the token, strlen + 1 and
++ * a pointer to an int64 handle (-1 = failure in the caller); op 7 releases
++ * a handle and op 8 updates a file token (both succeed by default).
++ * Userland treats tokens as opaque strings (only "invalid" is special), so
++ * a token with the layout of a real one and a dummy HMAC is enough: nothing
++ * is enforced. Before, both ops failed with ENOENT and every PosterBoard
++ * poster extension logged "SandboxExtensionError ... cannot extend access
++ * of <PRSPosterPath ...> due to sandbox errno=2" (no Collections poster).
++ */
++struct sweet_sandbox_issue_args {
++	user64_addr_t extension_class;
++	uint64_t      type;             /* 0 file, else mach/iokit/generic */
++	user64_addr_t data;             /* path or name */
++	uint64_t      flags;
++	user64_addr_t token;            /* out, SWEET_SANDBOX_TOKEN_MAX bytes */
++	int64_t       pid;              /* _to_process: audit token pid */
++	uint64_t      pidversion;
++};
++
++struct sweet_sandbox_consume_args {
++	user64_addr_t token;
++	uint64_t      token_len;
++	user64_addr_t handle;           /* out, int64_t */
++};
++
++#define SWEET_SANDBOX_TOKEN_MAX 2048
++#define SWEET_SANDBOX_CLASS_MAX 128
++
++static SInt64 sweet_sandbox_handles;
++
++static int
++sweet_sandbox_extension_issue(user_addr_t arg)
++{
++	struct sweet_sandbox_issue_args args;
++	char ext_class[SWEET_SANDBOX_CLASS_MAX];
++	size_t len;
++	int error = copyin(arg, &args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	if (copyinstr(args.extension_class, ext_class, sizeof(ext_class), &len)) {
++		ext_class[0] = '\0';
++	}
++	char *buf = kalloc_data(SWEET_SANDBOX_TOKEN_MAX + MAXPATHLEN, Z_WAITOK | Z_ZERO);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	char *data = buf + SWEET_SANDBOX_TOKEN_MAX;
++	if (args.data == 0 || copyinstr(args.data, data, MAXPATHLEN, &len)) {
++		data[0] = '\0';
++	}
++	uint64_t id = (uint64_t)OSIncrementAtomic64(&sweet_sandbox_handles) + 1;
++	int n = snprintf(buf, SWEET_SANDBOX_TOKEN_MAX,
++	    "%016llx%016llx%016llx%016llx;00;00000000;00000000;00000000;%016llx;%s;01;%08llx;%016llx;%s",
++	    id, id, id, id, (unsigned long long)strlen(ext_class), ext_class,
++	    args.type, id, data);
++	if (n < 0 || n >= SWEET_SANDBOX_TOKEN_MAX) {
++		error = ENAMETOOLONG;
++	} else {
++		error = copyout(buf, args.token, (size_t)n + 1);
++	}
++	kfree_data(buf, SWEET_SANDBOX_TOKEN_MAX + MAXPATHLEN);
++	return error;
++}
++
++static int
++sweet_sandbox_extension_consume(user_addr_t arg)
++{
++	struct sweet_sandbox_consume_args args;
++	int error = copyin(arg, &args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	int64_t handle = OSIncrementAtomic64(&sweet_sandbox_handles) + 1;
++	return copyout(&handle, args.handle, sizeof(handle));
++}
++
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -295,9 +379,11 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 		printf("SWEET Sandbox: %s op %d\n", name, call);
+ 	}
+ 	switch (call) {
+-	case 4:         /* container path (audit token / pid) */
+ 	case 5:         /* extension issue */
++		return sweet_sandbox_extension_issue(arg);
+ 	case 6:         /* extension consume */
++		return sweet_sandbox_extension_consume(arg);
++	case 4:         /* container path (audit token / pid) */
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:
