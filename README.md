@@ -28,7 +28,6 @@ This is not Corellium. Corellium boots Apple's own iOS kernel on virtual hardwar
 
 ## What does not work (yet)
 
-- **Most removable apps** (Mail, Notes, Calendar, Clock, Weather, Maps…) are not installed: they stay staged because first-boot data migration is skipped.
 - **No wallpaper** (PosterBoard crashes), and some daemons (bluetoothd, fairplayd, assetsd) keep restarting.
 - No GPU, no audio, camera, Bluetooth, cellular, location or Face ID.
 - **Security is off:** permissive code signing (AMFI) and Sandbox policies, a stub AppleKeyStore, no data protection.
