@@ -1,5 +1,8 @@
-/* A minimal user app for testing tools/install-app.py: one screen with a label. */
+/* A minimal user app for testing tools/install-app.py: one screen with a label
+ * whose text comes from the embedded HelloKit.framework (an @rpath load). */
 #import <UIKit/UIKit.h>
+
+extern NSString *HelloKitGreeting(void);
 
 @interface HelloDelegate : UIResponder <UIApplicationDelegate>
 @property (strong, nonatomic) UIWindow *window;
@@ -11,7 +14,7 @@
 	UIViewController *vc = [UIViewController new];
 	vc.view.backgroundColor = UIColor.systemTealColor;
 	UILabel *label = [UILabel new];
-	label.text = @"Hello from QEMU";
+	label.text = HelloKitGreeting();
 	label.font = [UIFont boldSystemFontOfSize:34];
 	label.textColor = UIColor.whiteColor;
 	label.translatesAutoresizingMaskIntoConstraints = NO;
