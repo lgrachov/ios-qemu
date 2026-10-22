@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """A usbmuxd for the QEMU guest, so libimobiledevice tools reach its lockdownd.
 
-  ios-usbmuxd.py RUN_DIR [--listen 127.0.0.1:27015] [--lockdown-port 62078] [--state DIR]
+  ios-usbmuxd.py [--listen 127.0.0.1:27015] [--mux-port 62079] [--state DIR]
 
-  USBMUXD_SOCKET_ADDRESS=127.0.0.1:27015 ideviceinfo -s
+  USBMUXD_SOCKET_ADDRESS=127.0.0.1:27015 ideviceinfo
 
 libimobiledevice never connects to a device itself: it asks usbmuxd for the
 device list and to connect to a device port. This speaks the usbmuxd plist
 protocol (16-byte header length/version/message/tag, XML plist body) and offers
 one device, the guest, as a USB device (ideviceinfo only looks at network
-devices with -n). The UDID comes from the guest's lockdownd. Connect to port
-62078 goes to qemu-sweet.py's forward (host 127.0.0.1:LOCKDOWN_PORT); any other
-guest port (lockdown services such as syslog_relay) gets a QEMU forward added on
-demand over QMP (RUN_DIR/mon.sock, HMP hostfwd_add; QMP is single-client, so it
-connects only for that). Pair records and the host BUID live in --state
-(default research/lockdown).
+devices with -n). The UDID comes from the guest's lockdownd. Every device
+connection goes through the guest kernel's mux relay (bsd/dev/sweet_mux.c,
+patch 0100; qemu-sweet.py forwards host 127.0.0.1:62079 to it): send the port
+as 2 bytes big endian, read one status byte (0 = connected, else errno), then
+the stream is the device port. The relay's sockets belong to the kernel, so
+lockdownd treats the connection as USB (pairing allowed) like on an iPhone.
+Pair records and the host BUID live in --state (default research/lockdown).
 """
-import argparse, json, os, plistlib, socket, socketserver, struct, threading, time, uuid
+import argparse, os, plistlib, socket, socketserver, struct, threading, time, uuid
 
 PLIST = 8
 RESULT_OK, RESULT_BADCOMMAND, RESULT_BADDEV, RESULT_CONNREFUSED = 0, 1, 2, 3
@@ -25,48 +26,23 @@ LOCKDOWN = 62078
 
 
 class Guest:
-    def __init__(self, run, lockdown_port, state):
-        self.run, self.lockdown_port, self.state = run, lockdown_port, state
+    def __init__(self, mux_port, state):
+        self.mux_port, self.state = mux_port, state
         self.udid = None
-        self.fwd = {LOCKDOWN: lockdown_port}
-        self.lock = threading.Lock()
         os.makedirs(state, exist_ok=True)
 
     def connect(self, port, timeout=5):
-        host_port = self.forward(port)
-        return socket.create_connection(('127.0.0.1', host_port), timeout=timeout)
-
-    def forward(self, port):
-        with self.lock:
-            if port not in self.fwd:
-                s = socket.socket()
-                s.bind(('127.0.0.1', 0))
-                host_port = s.getsockname()[1]
-                s.close()
-                self.hmp(f'hostfwd_add net0 tcp:127.0.0.1:{host_port}-:{port}')
-                self.fwd[port] = host_port
-            return self.fwd[port]
-
-    def hmp(self, command):
-        s = socket.socket(socket.AF_UNIX)
-        s.connect(os.path.join(self.run, 'mon.sock'))
-        f = s.makefile('rw')
+        s = socket.create_connection(('127.0.0.1', self.mux_port), timeout=timeout)
         try:
-            f.readline()
-            for ex, args in (('qmp_capabilities', {}), ('human-monitor-command', {'command-line': command})):
-                f.write(json.dumps({'execute': ex, 'arguments': args}) + '\n')
-                f.flush()
-                while True:
-                    r = json.loads(f.readline())
-                    if 'error' in r:
-                        raise RuntimeError(f'{command}: {r["error"]}')
-                    if 'return' in r:
-                        break
-            if r['return']:
-                raise RuntimeError(f'{command}: {r["return"].strip()}')
-        finally:
-            f.close()   # the makefile() handle keeps the socket open otherwise
+            s.sendall(struct.pack('>H', port))
+            status = recv_exact(s, 1)[0]
+        except (OSError, EOFError):
             s.close()
+            raise
+        if status:
+            s.close()
+            raise ConnectionRefusedError(f'guest port {port}: errno {status}')
+        return s
 
     def lockdown_get(self, key):
         """GetValue without a session: lockdownd answers basic keys unpaired."""
@@ -220,15 +196,14 @@ class Server(socketserver.ThreadingTCPServer):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('run', help='qemu-sweet.py output directory (for mon.sock)')
     ap.add_argument('--listen', default='127.0.0.1:27015')
-    ap.add_argument('--lockdown-port', type=int, default=LOCKDOWN)
+    ap.add_argument('--mux-port', type=int, default=62079, help="host port forwarded to the guest's mux relay")
     ap.add_argument('--state', default='research/lockdown')
     a = ap.parse_args()
     host, port = a.listen.rsplit(':', 1)
     server = Server((host, int(port)), Client)
-    server.guest = Guest(a.run, a.lockdown_port, a.state)
-    print(f'usbmuxd on {a.listen}: USBMUXD_SOCKET_ADDRESS={a.listen} ideviceinfo -s', flush=True)
+    server.guest = Guest(a.mux_port, a.state)
+    print(f'usbmuxd on {a.listen}: USBMUXD_SOCKET_ADDRESS={a.listen} ideviceinfo', flush=True)
     server.serve_forever()
 
 

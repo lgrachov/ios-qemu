@@ -341,8 +341,9 @@ def main():
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
     ap.add_argument('--live-log', action='store_true', help='stream the kernel message buffer to stdout (needs --kernel; own QMP socket log.sock)')
-    ap.add_argument('--lockdown-port', type=int, default=62078, metavar='PORT',
-                    help='with --ufs: forward host 127.0.0.1:PORT to the guest lockdownd (62078); 0 = off')
+    ap.add_argument('--mux-port', type=int, default=62079, metavar='PORT',
+                    help='with --ufs: forward host 127.0.0.1:PORT to the guest kernel mux relay (TCP 62079, '
+                         'bsd/dev/sweet_mux.c) for tools/ios-usbmuxd.py; 0 = off')
     ap.add_argument('--smp', type=int, default=1, help='vCPUs (secondaries start powered off for PSCI CPU_ON); needs an ADT from mkadt.py --cpus N')
     ap.add_argument('--hvf', action='store_true', help='hardware virtualization on Apple Silicon (-accel hvf -cpu host); needs an ADT from mkadt.py --hvf')
     ap.add_argument('--ufs', metavar='DISK', help='raw disk image (4 KiB-sector GPT, e.g. a "userdata" HFS+ partition) as a UFS LU; needs an ADT from mkadt.py --qemu-ufs and rd=ufsroot0')
@@ -415,8 +416,9 @@ def main():
         cmd += ['-global', 'virtio-mmio.force-legacy=false',
                 '-device', 'virtio-tablet-device', '-device', 'virtio-keyboard-device']
         # en0 for bsd/dev/sweet_vnet.c (sweetvnet=1): user-mode NAT, DHCP 10.0.2.15.
-        # Host 127.0.0.1:LOCKDOWN_PORT -> guest lockdownd (tools/ios-usbmuxd.py).
-        fwd = f',hostfwd=tcp:127.0.0.1:{a.lockdown_port}-:62078' if a.lockdown_port else ''
+        # Host 127.0.0.1:MUX_PORT -> the guest's kernel mux relay, which reaches lockdownd
+        # and its services as a USB peer (tools/ios-usbmuxd.py).
+        fwd = f',hostfwd=tcp:127.0.0.1:{a.mux_port}-:62079' if a.mux_port else ''
         cmd += ['-netdev', f'user,id=net0{fwd}', '-device', 'virtio-net-device,netdev=net0']
     if a.display:
         # the 1080x2400 panel is taller than most screens; zoom-to-fit scales the window.
