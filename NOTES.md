@@ -2,6 +2,24 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> RESUME HERE (2026-10-22 ~01:15 local, macOS host, QEMU) <<<
+
+**State:** iOS 16.7.16 boots in QEMU (hvf, M5 Mac) to lock/home screen with touch, hardware keyboard, full 1125x2436 display, Safari rendering, About and Date & Time fixed. Kernels are built on the fork's GitHub Actions (`lgrachov/ios-sweet`, push to `xnu/patches/**` builds; `gh run download RUN -R lgrachov/ios-sweet -n xnu-kernel -D xnu/out-NNNN`, then copy to `xnu/out-local`, which `./harness.sh` uses). Patches 0082-0094 are from this effort. Boot: `./harness.sh --ios research/iosroot/disk.img --secs 3600 [--bootargs "..."]`. Input/screenshots from scripts: `tools/qemu-touch.py RUN_DIR unlock|tap X Y|type TEXT|key power|screenshot OUT.png` (1125x2436 coords; QMP is single-client).
+
+**In progress: networking (task "Networking in QEMU").**
+- Done: 0090 virtio-net driver -> en0 (52:54:00:12:34:56, QEMU `-netdev user`: guest 10.0.2.15, gw/host 10.0.2.2, DNS 10.0.2.3) + IONetworkInterface (iOS auto-created an "Ethernet" DHCP service). 0091 BPF attach/taps. 0092 traces failing bpf writes / BIOCSETIF (`SWEET BPF:`). 0093 grants entitlement-backed network privileges (socket-delegate etc.): NECP delegation denials for mDNSResponder/WebKit are gone.
+- The user set the Ethernet service to **Manual** in Settings (10.0.2.15/24, router 10.0.2.2, DNS 10.0.2.3), saved on disk.img. configd applies it (SWEET NET trace: address + default route), ARP to 10.0.2.2 works (rx seen).
+- **Open problem:** no TCP/UDP packet leaves en0 (QEMU `filter-dump` pcap empty; Mac test server got no request) for Safari `http://example.com` or `http://10.0.2.2:8000`. Suspect another NECP policy drop or similar in the stack.
+- **Next action:** CI run `39697881026` builds **0094** (boot-arg `sweet_necp_debug=1|2` sets net.necp.debug). Download/install it, then boot with `--bootargs "sweet_necp_debug=2"`, attach a capture (QMP `object-add` qom-type filter-dump id=cap netdev=net0 file=ABS_PATH.pcap; `tcpdump -nn -r`), start the Mac test server (`cd research/www && python3 -m http.server 8000 --bind 127.0.0.1`), load `http://10.0.2.2:8000` in Safari (unlock swipe 562,2430->562,900; Safari dock icon 561,2259; address bar 562,2123; `type`), and read the NECP lines in the kernel log (`_smsg_bufc` memsave or `tools/ufsdisk-log.py research/iosroot/disk.img OUT` with the VM stopped). DHCP itself still fails (link-local fallback, only ARP sent): check `SWEET BPF:` lines on a DHCP boot later.
+
+**Plan after networking (in order):**
+1. Host clock at boot: QEMU virt PL031 RTC at 0x09010000 -> IORTC/calendar (needed for HTTPS; date is 1969 now).
+2. Multi-vCPU for speed (QEMU ADT with several CPU nodes + `-smp`; phone kernel supports 8 cores, 0078).
+3. Wallpaper: PosterBoard asserts `!_stateLock_switcherConfiguration` in PBFPosterExtensionDataStore "Setting up default wallpaper"; its store loads no poster extensions though all .appex are on disk.
+4. Daemon restart loops: bluetoothd, fairplayd.H2, assetsd (C++ abort).
+
+**Tools/files:** `tools/dsc-a2s.py research/dsc/dyld_shared_cache_arm64 ADDR...` (symbolicate; slide from SMP/CRASH lines), process sampler `--bootargs "sweetsample=Name1,Name2"` (stacks every 120 s from 90 s, plus SWEET BUSY lines), `sudo tools/iosroot-tweak.sh research/iosroot/disk.img` (re-apply root tweaks in place, VM stopped), disk.img mountable on macOS (`hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount`, `fsck_hfs -fy` after a hard stop), clone backup `research/disk-backup-lockscreen.img` (pre-tweak state). IPSW at `research/ipsw/`; `research/ipsw/x/087-86698-044.dmg` (OS image) re-extracted.
+
 ### >>> UPDATE 2026-10-21: QEMU on a macOS host: live display, hvf, root over emulated UFS <<<
 
 - **Settings > General > About FIXED (opens in <5 s, was ~3-5 min), kernels 0086-0088 (0088 = CI `39685193469` = `xnu/out-local`).** Chain: Settings main thread in dispatch_once behind SystemConfiguration `__wait_for_IOKit_to_quiesce` (PSUIPrefsListController updateEthernet -> _SCNetworkInterfaceCopyAllWithPreferences), which waits for configd InterfaceNamer's *QUIET* key. (1) 0086 sampler busy dump: root D22AP IOPlatformExpertDevice busy 1 forever = IOStartIOKit's kernelmanagerd busy count (macOS-source kernel; iOS has no IOKit daemon). **0087**: OSKext::iokitDaemonAvailable() false on SWEET + IOKit user resource published at setPMRootDomain (NO_KEXTD behaviour) -> 0 busy services. (2) Still waiting: ifnamer.c quietCallback returns "No network stack object" without IONetworkStack (IONetworkingFamily) -> only its 300 s stack timeout. **0088**: built-in IONetworkStack (+ user client accepting naming commands) under IOResources. Affects the phone too (same timeouts there), untested on the phone.
