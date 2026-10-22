@@ -4,6 +4,9 @@
   install-app.py setup DISK            add the installer to a guest disk (macOS + Xcode,
                                        VM stopped); booting never needs this
   install-app.py install APP.ipa       install into the running guest
+                [--resign]             first ad-hoc sign every binary in the IPA (macOS), for
+                                       bundles whose extensions or frameworks are unsigned or
+                                       carry signatures that no longer match (installd checks them)
   install-app.py uninstall BUNDLE_ID   remove an app (or long-press it on the home screen)
 
 setup builds tools/guest/qemu-appinstalld.m with the iOS SDK (ad-hoc signed
@@ -118,6 +121,35 @@ def talk(s, header, payload=b''):
     return 0 if ok else 1
 
 
+def resign(ipa):
+    """Ad-hoc sign every bundle and dylib in the IPA, innermost first (macOS codesign).
+    Entitlements are kept. Returns the bytes of the re-signed IPA."""
+    if sys.platform != 'darwin':
+        sys.exit('--resign needs macOS (codesign)')
+    with tempfile.TemporaryDirectory(prefix='ios-qemu-ipa-') as tmp:
+        with zipfile.ZipFile(ipa) as z:
+            z.extractall(tmp)
+        targets = []
+        for dirpath, dirnames, filenames in os.walk(os.path.join(tmp, 'Payload')):
+            if dirpath.endswith(('.app', '.appex', '.framework', '.xctest')):
+                targets.append(dirpath)
+            targets += [os.path.join(dirpath, f) for f in filenames if f.endswith('.dylib')]
+        for t in sorted(targets, key=lambda t: t.count(os.sep), reverse=True):
+            r = subprocess.run(['codesign', '-f', '-s', '-', '--preserve-metadata=entitlements', t],
+                               capture_output=True, text=True)
+            if r.returncode:
+                sys.exit(f'codesign {os.path.relpath(t, tmp)}: {r.stderr.strip()}')
+        out = os.path.join(tmp, 'resigned.ipa')
+        with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
+            for dirpath, dirnames, filenames in os.walk(os.path.join(tmp, 'Payload')):
+                for f in filenames:
+                    full = os.path.join(dirpath, f)
+                    z.write(full, os.path.relpath(full, tmp))
+        print(f're-signed {len(targets)} bundles/dylibs (ad-hoc)')
+        with open(out, 'rb') as f:
+            return f.read()
+
+
 def bundle_id(ipa):
     with zipfile.ZipFile(ipa) as z:
         names = [n for n in z.namelist() if re.fullmatch(r'Payload/[^/]+\.app/Info\.plist', n)]
@@ -135,7 +167,9 @@ def main():
     ap.add_argument('--mux-port', type=int, default=62079, help='host port of the guest mux relay')
     sub = ap.add_subparsers(dest='cmd', required=True)
     sub.add_parser('setup').add_argument('disk')
-    sub.add_parser('install').add_argument('ipa')
+    p = sub.add_parser('install')
+    p.add_argument('ipa')
+    p.add_argument('--resign', action='store_true', help='ad-hoc sign every binary first (macOS)')
     sub.add_parser('uninstall').add_argument('bundle_id')
     a = ap.parse_args()
     if a.cmd == 'setup':
@@ -143,8 +177,11 @@ def main():
         return 0
     if a.cmd == 'install':
         bid = bundle_id(a.ipa)
-        with open(a.ipa, 'rb') as f:
-            data = f.read()
+        if a.resign:
+            data = resign(a.ipa)
+        else:
+            with open(a.ipa, 'rb') as f:
+                data = f.read()
         print(f'installing {bid} ({len(data)} bytes)')
         return talk(connect(a.mux_port), f'INSTALL {bid} {len(data)}', data)
     return talk(connect(a.mux_port), f'UNINSTALL {a.bundle_id}')
