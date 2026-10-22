@@ -123,6 +123,12 @@ def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False, qemu_
         # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1080x2400 @3x =
         # 360x800 points (like iPhone X class devices).
         ('display-scale', u32(3)),
+        # iBoot fills these from syscfg (WMac/BMac). MobileGestalt derives the
+        # A11 UniqueDeviceID from them; without them lsd's database rebuild
+        # waits forever in MGCopyAnswer(UniqueDeviceID). Locally administered:
+        # Wi-Fi = QEMU's en0 MAC (sweet_vnet.c), Bluetooth = the next one.
+        ('mac-address-wifi0', bytes.fromhex('525400123456')),
+        ('mac-address-bluetooth0', bytes.fromhex('525400123457')),
         # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
         # files), so e.g. DataMigration never records LastSystemVersion and
