@@ -1,0 +1,100 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 90bcb64..13f43a3 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -30,6 +30,7 @@
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
++#include <sys/kauth.h>
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+@@ -282,8 +283,9 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). SWEET runs without a sandbox: operations succeed
+  * (checks allow, profile init is accepted); extensions are issued and
+- * consumed (below); container paths fail with ENOENT. The first use of
+- * each operation number is logged.
++ * consumed (below); app extensions get a container path (below), every
++ * other container query fails with ENOENT. The first use of each operation
++ * number is logged.
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
+@@ -369,6 +371,67 @@ sweet_sandbox_extension_consume(user_addr_t arg)
+ 	return copyout(&handle, args.handle, sizeof(handle));
+ }
+ 
++/*
++ * Op 4 (sandbox_container_path_for_pid / _for_audit_token) passes
++ * struct sweet_sandbox_container_args; on success the kernel writes the
++ * NUL-terminated container path into buf. libsystem_sandbox's
++ * _sandbox_in_a_container() is "op 4 succeeded", and containerized
++ * processes take their home from it, so only processes that need one get a
++ * path: PlugInKit's checkEnvironment aborts every app extension without
++ * it ("plugin has invalid sandbox or container: error 2"; Spotlight index
++ * extensions and the speech synthesizer AUs crash-looped, ~74 crashes per
++ * boot). App extensions (executable inside a .appex) running as mobile get
++ * the mobile home, as ios-sailfish found; on an iPhone they would get
++ * Containers/Data/PluginKitPlugin/<uuid>. Everything else keeps ENOENT, as
++ * an uncontainerized process on iOS.
++ */
++struct sweet_sandbox_container_args {
++	int64_t       pid;              /* 0 = the caller */
++	uint64_t      pidversion;       /* audit token variant */
++	user64_addr_t buf;
++	uint64_t      buflen;
++	uint64_t      by_audit_token;
++};
++
++#define SWEET_MOBILE_UID        501
++#define SWEET_MOBILE_HOME       "/private/var/mobile"
++
++static int
++sweet_sandbox_container_path(struct proc *caller, user_addr_t arg)
++{
++	struct sweet_sandbox_container_args args;
++	int error = copyin(arg, &args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	proc_t p = args.pid == 0 ? proc_find(proc_pid(caller)) : proc_find((int)args.pid);
++	if (p == NULL) {
++		return ESRCH;
++	}
++	kauth_cred_t cred = kauth_cred_proc_ref(p);
++	bool mobile = kauth_cred_getuid(cred) == SWEET_MOBILE_UID;
++	kauth_cred_unref(&cred);
++	bool appex = false;
++	vnode_t vp = mobile ? proc_getexecutablevnode(p) : NULLVP;
++	proc_rele(p);
++	if (vp != NULLVP) {
++		char *path = kalloc_data(MAXPATHLEN, Z_WAITOK | Z_NOFAIL);
++		int len = MAXPATHLEN;
++		if (vn_getpath(vp, path, &len) == 0) {
++			appex = strnstr(path, ".appex/", MAXPATHLEN) != NULL;
++		}
++		kfree_data(path, MAXPATHLEN);
++		vnode_put(vp);
++	}
++	if (!appex) {
++		return ENOENT;
++	}
++	if (args.buflen < sizeof(SWEET_MOBILE_HOME)) {
++		return ERANGE;
++	}
++	return copyout(SWEET_MOBILE_HOME, args.buf, sizeof(SWEET_MOBILE_HOME));
++}
++
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+@@ -384,6 +447,7 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ 	case 6:         /* extension consume */
+ 		return sweet_sandbox_extension_consume(arg);
+ 	case 4:         /* container path (audit token / pid) */
++		return sweet_sandbox_container_path(p, arg);
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:
