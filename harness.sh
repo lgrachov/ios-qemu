@@ -3,6 +3,8 @@
 #
 #   ./harness.sh [--secs N] [--no-display] [--no-log] [--hvf] [--ios DISK] [--cpus N] [--bootargs "..."] [--kernel PATH] [-- extra qemu-sweet.py args]
 #
+# Runs until the QEMU window is closed, the guest powers off or Ctrl-C (which
+# still saves the screen); --secs N stops after N seconds instead.
 # Rebuilds the QEMU ADT and payload when they are missing or older than the
 # kernel, then runs tools/qemu-sweet.py. --hvf uses Apple Silicon hardware
 # virtualization (its own ADT with the host timer frequency). --ios DISK boots
@@ -17,7 +19,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 KERNEL=xnu/out-local/kernel.development.sweet
-SECS=150
+SECS=0
 DISPLAY_ARG=--display
 LOG_ARG=--live-log
 HVF=
@@ -78,6 +80,7 @@ for d in /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin \
 done
 
 OUT=$W/run-$(date +%Y%m%d-%H%M%S)
-echo "running $KERNEL for ${SECS}s -> $OUT"
+if [ "$SECS" = 0 ]; then LIMIT="until Ctrl-C or the window closes"; else LIMIT="for ${SECS}s"; fi
+echo "running $KERNEL $LIMIT -> $OUT"
 python3 tools/qemu-sweet.py "$PAYLOAD" "$OUT" --secs "$SECS" --kernel "$KERNEL" \
 	$DISPLAY_ARG $LOG_ARG $HVF ${QEMU_ARGS[@]+"${QEMU_ARGS[@]}"} ${EXTRA[@]+"${EXTRA[@]}"}

@@ -9,7 +9,8 @@ the CPU at a 6-instruction stub that jumps to the entry with x0 = boot_args.
 virt RAM starts at 0x40000000; with 4G it covers the phone's framebuffer
 (0x9c000000) and the kernel's phys_base (0xb0000000) as plain memory.
 
-After N seconds (or when the guest stops) it writes into OUTDIR:
+After N seconds (--secs 0: no limit), on Ctrl-C, or when the guest stops,
+it writes into OUTDIR (Ctrl-C and the time limit capture the screen too):
   fb.png     the 1080x2400 framebuffer (what the phone screen would show)
   regs.txt   QEMU's view of CPU state
   qemu.log   exceptions with ESR/FAR/ELR (-d int,guest_errors)
@@ -24,7 +25,7 @@ With --display, the stub (tools/qemu-ramfb-stub.S, assembled with clang)
 first points QEMU's ramfb device at the framebuffer, so a QEMU window shows
 the screen live while the guest runs.
 """
-import argparse, json, os, re, shutil, socket, struct, subprocess, sys, time, zlib
+import argparse, json, os, re, shutil, signal, socket, struct, subprocess, sys, time, zlib
 
 FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400
 FB_STRIDE = FB_W * 4
@@ -332,7 +333,7 @@ def main():
     )
     ap.add_argument('payload', nargs='?', help='SWEETXNU payload binary (from mkpayload.py)')
     ap.add_argument('outdir', nargs='?', help='Output directory for fb.png, regs.txt, and logs')
-    ap.add_argument('--secs', type=float, default=20, help='Duration to run QEMU in seconds (default: 20)')
+    ap.add_argument('--secs', type=float, default=20, help='Duration to run QEMU in seconds, 0 = until Ctrl-C or QEMU exits (default: 20)')
     ap.add_argument('--gdb', action='store_true', help='start halted, gdb stub on :1234, no timeout')
     ap.add_argument('--hmp', action='append', default=[], help='extra monitor command run after stop (repeatable), e.g. "x /8gx 0xfffffe..."')
     ap.add_argument('--cpu', default='cortex-a76', help='QEMU CPU model (default: cortex-a76)')
@@ -433,19 +434,30 @@ def main():
     live_log = MsgbufStream(f'{out}/log.sock', a.kernel, f'{out}/msgbuf.part') if a.live_log and a.kernel else None
 
     try:
-        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+        # own process group: Ctrl-C reaches only this script, which then
+        # captures the screen and stops QEMU itself. SIGTERM/SIGHUP (terminal
+        # closed) do the same; SIGINT is set explicitly because a background
+        # job (`cmd &` in a script) inherits it ignored.
+        def interrupt(*_):
+            raise KeyboardInterrupt
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, interrupt)
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, process_group=0)
         if a.gdb:
             print('gdb stub on :1234; QMP socket:', mon, file=sys.stderr)
             p.wait()
             return 0
 
         t0 = time.time()
-        while p.poll() is None and time.time() - t0 < a.secs:
-            if a.live_serial:
-                serial_pos = stream_serial_file(serial_file, serial_pos)
-            if live_log:
-                live_log.poll()
-            time.sleep(0.2)
+        try:
+            while p.poll() is None and (a.secs <= 0 or time.time() - t0 < a.secs):
+                if a.live_serial:
+                    serial_pos = stream_serial_file(serial_file, serial_pos)
+                if live_log:
+                    live_log.poll()
+                time.sleep(0.2)
+        except KeyboardInterrupt:
+            print('\n[!] Interrupted, capturing the screen and stopping QEMU...', file=sys.stderr)
 
         if a.live_serial:
             stream_serial_file(serial_file, serial_pos)
@@ -475,7 +487,8 @@ def main():
         if a.fail_on_panic and result['status'] in ('incomplete_decode', 'blank_screen'):
             return 3
         if result['status'] == 'qemu_exited':
-            return 1
+            # without a time limit, closing the window or powering off is the normal end
+            return 0 if a.secs <= 0 and p.returncode == 0 else 1
         return 0
 
     except KeyboardInterrupt:
@@ -485,6 +498,9 @@ def main():
             p.wait()
         return 130
     finally:
+        if p and p.poll() is None:	# QEMU is in its own process group: never leave it running
+            p.kill()
+            p.wait()
         ram_file = f'{out}/ram.bin'
         if os.path.exists(ram_file):
             try:
