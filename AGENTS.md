@@ -10,7 +10,7 @@
   after each milestone and before stopping. Record commits, CI run IDs, exact
   build/boot results and unfinished work. Distinguish observations from guesses.
 - Commit completed changes. Use `gh` for GitHub Actions kernel builds and logs
-  (the fork `lgrachov/ios-sweet`; pushes to `xnu/patches/**` build).
+  (the fork `lgrachov/ios-qemu`; pushes to `xnu/patches/**` build).
 - `research/iosroot/disk.img` is the working guest disk: make an APFS clone
   (`cp -c`) before changes that are hard to undo.
 - Keep downloaded Apple artifacts (IPSWs, root images, shared caches) out of git.
