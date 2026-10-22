@@ -29,10 +29,9 @@ This is not Corellium. Corellium boots Apple's own iOS kernel on virtual hardwar
 ## What does not work (yet)
 
 - **DHCP.** Set the "Ethernet" service to Manual once in Settings: IP 10.0.2.15, subnet 255.255.255.0, router 10.0.2.2, DNS 10.0.2.3. It is saved on the disk.
-- **HTTPS is untested** since the clock fix.
 - **Most removable apps** (Mail, Notes, Calendar, Clock, Weather, Maps…) are not installed: they stay staged because first-boot data migration is skipped.
 - **No wallpaper** (PosterBoard crashes), and some daemons (bluetoothd, fairplayd, assetsd) keep restarting.
-- **One virtual CPU**, no GPU, no audio, camera, Bluetooth, cellular, location or Face ID.
+- No GPU, no audio, camera, Bluetooth, cellular, location or Face ID.
 - **Security is off:** permissive code signing (AMFI) and Sandbox policies, a stub AppleKeyStore, no data protection.
 
 ## Requirements
