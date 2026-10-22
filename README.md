@@ -21,14 +21,13 @@ This is not Corellium. Corellium boots Apple's own iOS kernel on virtual hardwar
 | GUI | Lock screen, home screen, Settings (About, Date & Time), Safari |
 | Touch | Mouse clicks and drags in the window (virtio-tablet → HID digitizer) |
 | Keyboard | Attached hardware keyboard (virtio-keyboard → HID). Ctrl+Option+P power, Ctrl+Option+H or Esc home, Ctrl+Option+Up/Down volume |
-| Network | virtio-net as `en0` on QEMU user networking: DNS, TCP, QUIC, Safari over HTTP |
+| Network | virtio-net as `en0` on QEMU user networking: DHCP, DNS, TCP, QUIC, HTTP and HTTPS in Safari |
 | Clock | Host time through QEMU's PL031 RTC |
 | Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
 | Scripting | Touch, typing, buttons and screenshots from the command line (`tools/qemu-touch.py`); live kernel log (`tools/qemu-klog.py`) |
 
 ## What does not work (yet)
 
-- **DHCP.** Set the "Ethernet" service to Manual once in Settings: IP 10.0.2.15, subnet 255.255.255.0, router 10.0.2.2, DNS 10.0.2.3. It is saved on the disk.
 - **Most removable apps** (Mail, Notes, Calendar, Clock, Weather, Maps…) are not installed: they stay staged because first-boot data migration is skipped.
 - **No wallpaper** (PosterBoard crashes), and some daemons (bluetoothd, fairplayd, assetsd) keep restarting.
 - No GPU, no audio, camera, Bluetooth, cellular, location or Face ID.
