@@ -1,0 +1,22 @@
+diff --git a/bsd/net/necp.c b/bsd/net/necp.c
+--- a/bsd/net/necp.c
++++ b/bsd/net/necp.c
+@@ -75,6 +75,7 @@
+ #include <mach-o/loader.h>
+ #include <net/network_agent.h>
+ #include <net/necp.h>
++#include <pexpert/pexpert.h>
+ #include <netinet/flow_divert_proto.h>
+ 
+ /*
+@@ -1634,6 +1635,10 @@
+ {
+ 	necp_log_handle = os_log_create("com.apple.xnu.net.necp", "necp");
+ 	necp_data_trace_log_handle = os_log_create("com.apple.xnu.net.necp", "necp-data-trace");
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* QEMU en0 bring-up: net.necp.debug at boot (1 basic, 2 every match) */
++	(void)PE_parse_boot_argn("sweet_necp_debug", &necp_debug, sizeof(necp_debug));
++#endif
+ 
+ 	necp_client_init();
+ 
