@@ -1,0 +1,279 @@
+diff --git a/iokit/Kernel/arm/SweetMetal.cpp b/iokit/Kernel/arm/SweetMetal.cpp
+index 5170d92..c5358ea 100644
+--- a/iokit/Kernel/arm/SweetMetal.cpp
++++ b/iokit/Kernel/arm/SweetMetal.cpp
+@@ -11,11 +11,12 @@
+  * the guest bundle QEMUMetal records Metal commands and a helper on the
+  * host replays them on the host's Metal.
+  *
+- * They talk through a shared region: QEMU's ivshmem-plain BAR2, which the
+- * boot stub places at boot-arg sweetmetal_pa (default 0x20000000, 256 MiB).
+- * The region is split into SWEET_METAL_SLOTS slots; opening this service's
++ * They talk through a shared region: guest RAM at boot-arg sweetmetal_pa
++ * (default 0xa0000000, 256 MiB), below phys_base so the kernel never uses
++ * it; QEMU backs all of guest RAM with a file the host helper maps too
++ * (qemu-sweet.py --metal). The region is split into SWEET_METAL_SLOTS slots; opening this service's
+  * user client and calling selector 0 gives the process a free slot, mapped
+- * into it (cacheable: the BAR is ordinary host memory). The kernel owns the
++ * into it (cacheable: it is ordinary RAM). The kernel owns the
+  * first words of each slot header (layout: tools/guest/qemu-metal/qmtl.h):
+  * it fills them on attach and marks the slot free again when the client
+  * closes or the process dies, bumping the generation either way so the
+@@ -35,6 +36,7 @@
+ #include <libkern/OSAtomic.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/proc.h>
++#include "SweetSurface.h"
+ 
+ /* tools/guest/qemu-metal/qmtl.h */
+ #define SWEET_METAL_SIZE        0x10000000ULL
+@@ -84,7 +86,7 @@ IOAcceleratorES::start(IOService *provider)
+ 	if (!PE_parse_boot_argn("sweetmetal", &enabled, sizeof(enabled)) || !enabled) {
+ 		return false;
+ 	}
+-	fPhys = 0x20000000ULL;
++	fPhys = 0xa0000000ULL;
+ 	PE_parse_boot_argn("sweetmetal_pa", &fPhys, sizeof(fPhys));
+ 	fLock = IOLockAlloc();
+ 	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fPhys, SWEET_METAL_SIZE, kIODirectionInOut);
+@@ -242,6 +244,9 @@ IOAcceleratorESUserClient::clientClose(void)
+ /*
+  * Selector 0, attach: no input; out 4 scalars = slot index, user address of
+  * the slot, slot size, generation.
++ * Selector 1, surface: in 1 scalar = IOSurface id; out 4 scalars = physical
++ * address in the surface pool (0: not in it), allocation size, bytes per
++ * row, offset of the pixels (SweetSurface.cpp).
+  */
+ IOReturn
+ IOAcceleratorESUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+@@ -250,6 +255,18 @@ IOAcceleratorESUserClient::externalMethod(uint32_t selector, IOExternalMethodArg
+ {
+ 	IOAcceleratorES *acc = OSDynamicCast(IOAcceleratorES, getProvider());
+ 
++	if (selector == 1 && args->scalarInputCount >= 1 && args->scalarOutputCount >= 4) {
++		SweetSurface *s = sweet_surface_copy((uint32_t)args->scalarInput[0]);
++		if (s == NULL) {
++			return kIOReturnNotFound;
++		}
++		args->scalarOutput[0] = sweet_surface_pool_phys(s);
++		args->scalarOutput[1] = s->allocSize;
++		args->scalarOutput[2] = s->bytesPerRow;
++		args->scalarOutput[3] = s->offset;
++		s->release();
++		return kIOReturnSuccess;
++	}
+ 	if (selector != 0 || acc == NULL || args->scalarOutputCount < 4) {
+ 		return kIOReturnUnsupported;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..3990815 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -34,6 +34,7 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/system.h>
++#include <pexpert/pexpert.h>
+ #include <libkern/c++/OSArray.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+@@ -77,6 +78,123 @@ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
++/*
++ * Metal remoting surface pool (boot-arg sweetmetal=1, see SweetMetal.cpp):
++ * guest RAM below phys_base that the kernel never manages (boot-args
++ * sweetmetal_pool_pa/_size, default 0xb0000000 + 1.25 GiB). QEMU shares all
++ * of guest RAM with the host helper, so a surface allocated here is memory
++ * the host GPU renders into and samples in place: no copies in either
++ * direction. Physically contiguous, first fit, page granular; when it is
++ * full, surfaces come from ordinary wired memory as before.
++ */
++#define SWEET_POOL_SPANS        1024
++
++static IOLock      *sweet_pool_lock;
++static IOMemoryMap *sweet_pool_map;
++static uint64_t     sweet_pool_pa;
++static struct { uint64_t off, len; } sweet_pool_free[SWEET_POOL_SPANS];
++static int          sweet_pool_nfree;
++static int          sweet_pool_state;   /* 0 unset, 1 on, -1 off */
++
++static bool sweet_pool_setup(void);
++
++/* sweet_surface_lock exists (sweet_surface_alloc) */
++static bool
++sweet_pool_init(void)
++{
++	IOLockLock(sweet_surface_lock);
++	bool on = sweet_pool_state != 0 ? sweet_pool_state > 0 : sweet_pool_setup();
++	IOLockUnlock(sweet_surface_lock);
++	return on;
++}
++
++static bool
++sweet_pool_setup(void)
++{
++	uint32_t enabled = 0;
++	uint64_t size = 0x50000000ULL;
++	sweet_pool_pa = 0xb0000000ULL;
++	sweet_pool_state = -1;
++	if (!PE_parse_boot_argn("sweetmetal", &enabled, sizeof(enabled)) || !enabled) {
++		return false;
++	}
++	PE_parse_boot_argn("sweetmetal_pool_pa", &sweet_pool_pa, sizeof(sweet_pool_pa));
++	PE_parse_boot_argn("sweetmetal_pool_size", &size, sizeof(size));
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(sweet_pool_pa, size, kIODirectionInOut);
++	if (md != NULL) {
++		sweet_pool_map = md->map(kIOMapCopybackCache);
++		md->release();
++	}
++	sweet_pool_lock = IOLockAlloc();
++	if (sweet_pool_map == NULL || sweet_pool_lock == NULL) {
++		IOLog("SWEET SURF: no Metal surface pool at %#llx\n", sweet_pool_pa);
++		return false;
++	}
++	sweet_pool_free[0].off = 0;
++	sweet_pool_free[0].len = size;
++	sweet_pool_nfree = 1;
++	sweet_pool_state = 1;
++	IOLog("SWEET SURF: Metal surface pool %#llx + %llu MiB\n", sweet_pool_pa, size >> 20);
++	return true;
++}
++
++/* Physical address of len bytes (page multiple), or 0. */
++static uint64_t
++sweet_pool_alloc(uint64_t len)
++{
++	uint64_t pa = 0;
++	IOLockLock(sweet_pool_lock);
++	for (int i = 0; i < sweet_pool_nfree; i++) {
++		if (sweet_pool_free[i].len >= len) {
++			pa = sweet_pool_pa + sweet_pool_free[i].off;
++			sweet_pool_free[i].off += len;
++			sweet_pool_free[i].len -= len;
++			if (sweet_pool_free[i].len == 0) {
++				memmove(&sweet_pool_free[i], &sweet_pool_free[i + 1], (sweet_pool_nfree - i - 1) * sizeof(sweet_pool_free[0]));
++				sweet_pool_nfree--;
++			}
++			break;
++		}
++	}
++	IOLockUnlock(sweet_pool_lock);
++	return pa;
++}
++
++static void
++sweet_pool_release(uint64_t pa, uint64_t len)
++{
++	uint64_t off = pa - sweet_pool_pa;
++	IOLockLock(sweet_pool_lock);
++	int i = 0;
++	while (i < sweet_pool_nfree && sweet_pool_free[i].off < off) {
++		i++;
++	}
++	bool prev = i > 0 && sweet_pool_free[i - 1].off + sweet_pool_free[i - 1].len == off;
++	bool next = i < sweet_pool_nfree && off + len == sweet_pool_free[i].off;
++	if (prev && next) {
++		sweet_pool_free[i - 1].len += len + sweet_pool_free[i].len;
++		memmove(&sweet_pool_free[i], &sweet_pool_free[i + 1], (sweet_pool_nfree - i - 1) * sizeof(sweet_pool_free[0]));
++		sweet_pool_nfree--;
++	} else if (prev) {
++		sweet_pool_free[i - 1].len += len;
++	} else if (next) {
++		sweet_pool_free[i].off = off;
++		sweet_pool_free[i].len += len;
++	} else if (sweet_pool_nfree < SWEET_POOL_SPANS) {
++		memmove(&sweet_pool_free[i + 1], &sweet_pool_free[i], (sweet_pool_nfree - i) * sizeof(sweet_pool_free[0]));
++		sweet_pool_free[i].off = off;
++		sweet_pool_free[i].len = len;
++		sweet_pool_nfree++;
++	}
++	IOLockUnlock(sweet_pool_lock);
++}
++
++uint64_t
++sweet_surface_pool_phys(SweetSurface *s)
++{
++	return s->poolPhys;
++}
++
+ void
+ SweetSurface::free()
+ {
+@@ -84,6 +202,12 @@ SweetSurface::free()
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	if (poolPhys != 0) {
++		/* user and kernel mappings are gone with the last reference */
++		OSSafeReleaseNULL(memory);
++		sweet_pool_release(poolPhys, round_page(allocSize));
++		poolPhys = 0;
++	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+@@ -98,7 +222,9 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		/* pool surfaces are ordinary RAM: read them cached (the framebuffer
++		   copies whole frames out of them) */
++		kernelMap = memory->map(poolPhys != 0 ? kIOMapCopybackCache : kIOMapWriteCombineCache);
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -684,7 +810,24 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++	if (ret == kIOReturnSuccess && sweet_pool_init()) {
++		uint64_t len = round_page(s->allocSize);
++		uint64_t pa = sweet_pool_alloc(len);
++		if (pa != 0) {
++			s->memory = IOMemoryDescriptor::withPhysicalAddress(pa, s->allocSize, kIODirectionInOut);
++			if (s->memory == NULL) {
++				sweet_pool_release(pa, len);
++			} else {
++				s->poolPhys = pa;
++				s->mapCache = kIOMapCopybackCache;
++				bzero((void *)(sweet_pool_map->getVirtualAddress() + (pa - sweet_pool_pa)), s->allocSize);
++				if (!sweet_surface_publish(s)) {
++					ret = kIOReturnNoResources;
++				}
++			}
++		}
++	}
++	if (ret == kIOReturnSuccess && s->memory == NULL) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..efa6467 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -39,6 +39,7 @@ public:
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	uint64_t                  poolPhys;     /* in the Metal surface pool, or 0 */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -58,6 +59,13 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
++/*
++ * Metal remoting (boot-arg sweetmetal=1): physical address of a surface
++ * allocated from the shared surface pool, which the host GPU can render
++ * into in place; 0 if the surface is elsewhere.
++ */
++uint64_t sweet_surface_pool_phys(SweetSurface *surface);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
