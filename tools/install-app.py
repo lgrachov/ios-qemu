@@ -138,6 +138,12 @@ def resign(ipa):
             r = subprocess.run(['codesign', '-f', '-s', '-', '--preserve-metadata=entitlements', t],
                                capture_output=True, text=True)
             if r.returncode:
+                # modified apps can carry an entitlements blob codesign cannot parse
+                # ("invalid entitlements blob"; iOS ignores it too): sign without
+                r = subprocess.run(['codesign', '-f', '-s', '-', t], capture_output=True, text=True)
+                if r.returncode == 0:
+                    print(f'warning: {os.path.relpath(t, tmp)}: entitlements could not be kept, signed without them')
+            if r.returncode:
                 sys.exit(f'codesign {os.path.relpath(t, tmp)}: {r.stderr.strip()}')
         out = os.path.join(tmp, 'resigned.ipa')
         with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
