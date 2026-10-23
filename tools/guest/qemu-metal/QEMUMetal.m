@@ -6,15 +6,23 @@
  * QEMUMTLDevice. iOS 16 Metal (MTLRegisterDevices) then loads
  * /System/Library/Extensions/QEMUMetal.bundle and calls
  * [[QEMUMTLDevice alloc] initWithAcceleratorPort:service]; the class must
- * be a subclass of _MTLDevice.
+ * be a subclass of _MTLDevice, and MTLAddDevice asserts that it conforms to
+ * the MTLDevice and MTLDeviceSPI protocols (added at load time below, so
+ * the compiler does not demand every method).
  *
  * This device does no rendering. Every method that _MTLDevice leaves
  * abstract (it calls doesNotRecognizeSelector:) or does not have at all is
  * logged once per process and returns nil/0, so a boot shows which Metal
  * calls CoreAnimation and the other clients make. Log: one line per event
  * in /private/var/tmp/QEMUMetal.log (any user can append) and os_log.
+ * Methods _MTLDevice answers itself never reach these hooks, so creating
+ * the device also turns on libobjc's message tracer
+ * (instrumentObjcMessageSends: every class/selector pair on a method-cache
+ * miss, written to /tmp/msgSends-<pid>).
  */
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <os/log.h>
@@ -78,6 +86,15 @@ static void log_selector(const char *kind, SEL sel)
 
 __attribute__((constructor)) static void loaded(void)
 {
+	Class cls = objc_getClass("QEMUMTLDevice");
+	static const char *names[] = { "MTLDevice", "MTLDeviceSPI" };
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		const char *name = names[i];
+		Protocol *p = objc_getProtocol(name);
+		if (!p || !class_addProtocol(cls, p)) {
+			qlog("protocol %s: %s", name, p ? "already there" : "not found");
+		}
+	}
 	qlog("bundle loaded");
 }
 
@@ -87,7 +104,22 @@ __attribute__((constructor)) static void loaded(void)
 {
 	self = [super init];
 	qlog("initWithAcceleratorPort: port 0x%x -> %p", port, self);
+	void (*trace)(BOOL) = (void (*)(BOOL))dlsym(RTLD_DEFAULT, "instrumentObjcMessageSends");
+	if (trace) {
+		trace(YES);
+	}
 	return self;
+}
+
+/* asked by MTLAddDevice (initLimits / initFeatureQueries); A11 values */
+- (unsigned long long)featureProfile
+{
+	return 5;	/* -[AGXA11FamilyDevice featureProfile] */
+}
+
+- (unsigned long long)maxBufferLength
+{
+	return 256ULL << 20;
 }
 
 - (NSString *)name
