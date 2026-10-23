@@ -1,0 +1,15 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 3990815..6757621 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -722,6 +722,10 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;
+ 		p[0x1b] = pl->elementHeight;
++		/* IOSurfaceClientGetBaseAddressOfPlane only uses the plane's offset
++		   when this is 1; otherwise plane 0 is the surface base and every
++		   other plane is NULL (video decoders then write chroma to garbage) */
++		p[0x54] = 1;
+ 	}
+ }
+ 
