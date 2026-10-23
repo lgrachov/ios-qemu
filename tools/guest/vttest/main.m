@@ -122,9 +122,10 @@ static void planar_check(void)
 	}
 	IOSurfaceRef s = CVPixelBufferGetIOSurface(pb);
 	CVPixelBufferLockBaseAddress(pb, 0);
-	out(@"420v pixel buffer (IOSurface %u, %zu planes): plane 0 %p, plane 1 %p, offsets %zu / %zu",
+	out(@"420v pixel buffer (IOSurface %u, %zu planes): plane 0 %p, plane 1 %p, offsets %zu / %zu, bytes per row %zu / %zu",
 	    s ? IOSurfaceGetID(s) : 0, CVPixelBufferGetPlaneCount(pb), CVPixelBufferGetBaseAddressOfPlane(pb, 0),
-	    CVPixelBufferGetBaseAddressOfPlane(pb, 1), s ? IOSurfaceGetOffsetOfPlane(s, 0) : 0, s ? IOSurfaceGetOffsetOfPlane(s, 1) : 0);
+	    CVPixelBufferGetBaseAddressOfPlane(pb, 1), s ? IOSurfaceGetOffsetOfPlane(s, 0) : 0, s ? IOSurfaceGetOffsetOfPlane(s, 1) : 0,
+	    CVPixelBufferGetBytesPerRowOfPlane(pb, 0), CVPixelBufferGetBytesPerRowOfPlane(pb, 1));
 	CVPixelBufferUnlockBaseAddress(pb, 0);
 	CVPixelBufferRelease(pb);
 }
