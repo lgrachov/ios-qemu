@@ -36,6 +36,7 @@
 
 static volatile sig_atomic_t stop;
 static id<MTLDevice> device;
+static id<MTLBuffer> pool;	/* the IOSurface pool (qmtl.h), shared by all slots */
 
 static void on_signal(int sig)
 {
@@ -80,6 +81,12 @@ static void hlog(const char *fmt, ...)
 
 static const void *linear_key = &linear_key;
 
+/* BC, PVRTC, EAC/ETC, ASTC: never linear on the host */
+static bool is_compressed(MTLPixelFormat f)
+{
+	return (f >= 130 && f <= 143) || (f >= 160 && f <= 183) || (f >= 186 && f <= 235);
+}
+
 /* a guest command buffer and the IOSurface read-backs it asked for */
 @interface HCommandBuffer : NSObject {
 @public
@@ -100,6 +107,8 @@ static const void *linear_key = &linear_key;
 	id<MTLBuffer> heap;
 	NSMutableDictionary<NSNumber *, id> *objects;
 	uint64_t ops, draws, commits;
+	uint64_t commits_last_second;
+	_Atomic uint64_t gpu_us, gpu_max_us, done_cbs;	/* commit -> completed, since the last stats line */
 	NSMutableSet<NSString *> *warned;
 }
 @end
@@ -178,6 +187,24 @@ static void drop_objects(Slot *s)
 
 /* ---- creation ops ---- */
 
+/* bytes per pixel of uncompressed formats we can check, else 0 */
+static NSUInteger plain_bpp(MTLPixelFormat f)
+{
+	if (f >= 10 && f <= 14) return 1;	/* 8-bit one channel */
+	if (f >= 20 && f <= 34) return 2;	/* 16-bit */
+	if (f >= 50 && f <= 94) return 4;	/* 32-bit incl. RGBA8/BGRA8/10-bit */
+	if (f >= 100 && f <= 115) return 8;	/* 64-bit */
+	if (f >= 120 && f <= 126) return 16;	/* 128-bit */
+	return 0;
+}
+
+/* rows long enough for width pixels (formats we cannot size are not checked) */
+static bool rows_fit(id<MTLTexture> t, uint64_t bpr, uint32_t width)
+{
+	NSUInteger bpp = plain_bpp(t.pixelFormat);
+	return bpp == 0 || bpr >= width * bpp;
+}
+
 static void op_texture_new(Slot *s, const struct qmtl_texture_new *c)
 {
 	MTLTextureDescriptor *d = [MTLTextureDescriptor new];
@@ -196,11 +223,15 @@ static void op_texture_new(Slot *s, const struct qmtl_texture_new *c)
 		d.swizzle = MTLTextureSwizzleChannelsMake(sw & 0xff, (sw >> 8) & 0xff, (sw >> 16) & 0xff, sw >> 24);
 	}
 	id<MTLTexture> t = nil;
-	if (c->buffer) {
+	if (c->pool_off != ~0ULL && pool && c->pool_off < QMTL_POOL_SIZE &&
+	    c->pool_bpr * d.height <= QMTL_POOL_SIZE - c->pool_off) {
+		d.storageMode = MTLStorageModeShared;
+		t = [pool newTextureWithDescriptor:d offset:c->pool_off bytesPerRow:c->pool_bpr];
+	} else if (c->buffer) {
 		GET(HBuffer *, b, s, c->buffer, "texture on buffer");
 		if (b) {
 			d.storageMode = MTLStorageModeShared;
-			NSUInteger align = [device minimumLinearTextureAlignmentForPixelFormat:d.pixelFormat];
+			NSUInteger align = is_compressed(d.pixelFormat) ? 0 : [device minimumLinearTextureAlignmentForPixelFormat:d.pixelFormat];
 			uint64_t off = heap_rel(b->off) + c->buffer_offset;
 			if (align && off % align == 0 && c->bytes_per_row % MAX(align, 16u) == 0) {
 				t = [s->heap newTextureWithDescriptor:d offset:off bytesPerRow:c->bytes_per_row];
@@ -221,7 +252,10 @@ static void op_texture_new(Slot *s, const struct qmtl_texture_new *c)
 		hlog("slot %d: texture %u %ux%u format %u failed", s->index, c->id, c->desc.width, c->desc.height, c->desc.pixel_format);
 		return;
 	}
-	if (c->init_off != ~0ULL && in_heap(c->init_off, c->init_bpi)) {
+	if (c->init_off != ~0ULL && in_heap(c->init_off, c->init_bpi) && !rows_fit(t, c->init_bpr, (uint32_t)d.width)) {
+		warn_once(s, [NSString stringWithFormat:@"surface texture: %llu bytes per row too short for %lu pixels of format %lu",
+		    c->init_bpr, (unsigned long)d.width, (unsigned long)d.pixelFormat]);
+	} else if (c->init_off != ~0ULL && in_heap(c->init_off, c->init_bpi)) {
 		if (t.storageMode == MTLStorageModeShared) {
 			[t replaceRegion:MTLRegionMake2D(0, 0, d.width, d.height) mipmapLevel:0 slice:0
 			    withBytes:heap_ptr(s, c->init_off) bytesPerRow:c->init_bpr bytesPerImage:c->init_bpi];
@@ -236,6 +270,14 @@ static void op_texture_io(Slot *s, const struct qmtl_texture_io *c, bool read)
 {
 	GET(id<MTLTexture>, t, s, c->id, read ? "texture read" : "texture replace");
 	NSUInteger rows = MAX(c->region.h, 1u) * MAX(c->region.d, 1u);
+	if (t && !rows_fit(t, c->bytes_per_row, c->region.w)) {
+		warn_once(s, [NSString stringWithFormat:@"texture %s: %llu bytes per row too short for %u pixels of format %lu",
+		    read ? "read" : "replace", c->bytes_per_row, c->region.w, (unsigned long)t.pixelFormat]);
+		if (read) {
+			reply_error(s, @"texture read: rows too short");
+		}
+		return;
+	}
 	if (!t || !in_heap(c->staging_off, c->bytes_per_row * rows)) {
 		if (read) {
 			reply_error(s, @"texture read: bad texture or staging");
@@ -503,7 +545,17 @@ static void op_cb_commit(Slot *s, const struct qmtl_cb_commit *c)
 		done(MTLCommandBufferErrorInternal);
 		return;
 	}
+	struct timespec t0;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
 	[hcb->cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+		struct timespec t1;
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		uint64_t us = (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_nsec - t0.tv_nsec) / 1000);
+		atomic_fetch_add(&s->gpu_us, us);
+		atomic_fetch_add(&s->done_cbs, 1);
+		uint64_t m = atomic_load(&s->gpu_max_us);
+		while (us > m && !atomic_compare_exchange_weak(&s->gpu_max_us, &m, us)) {
+		}
 		uint32_t error = cb.status == MTLCommandBufferStatusError ? (uint32_t)(cb.error.code ?: 1) : 0;
 		if (error) {
 			hlog("command buffer %llu: %s", serial, cb.error.localizedDescription.UTF8String);
@@ -922,19 +974,22 @@ static bool serve(Slot *s)
 	return worked;
 }
 
-static uint8_t *map_shared(const char *path)
+static uint8_t *map_shared(const char *path, uint64_t pa, uint64_t size, bool wait)
 {
 	/* QEMU creates and sizes the file; wait for it */
 	for (int i = 0; !stop; i++) {
 		struct stat st;
-		if (stat(path, &st) == 0 && (uint64_t)st.st_size >= QMTL_PA - QMTL_RAM_BASE + QMTL_SIZE) {
+		if (stat(path, &st) == 0 && (uint64_t)st.st_size >= pa - QMTL_RAM_BASE + size) {
 			int fd = open(path, O_RDWR);
 			if (fd < 0) {
 				break;
 			}
-			void *p = mmap(NULL, QMTL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, QMTL_PA - QMTL_RAM_BASE);
+			void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, pa - QMTL_RAM_BASE);
 			close(fd);
 			return p == MAP_FAILED ? NULL : p;
+		}
+		if (!wait) {
+			break;
 		}
 		if (i == 0) {
 			hlog("waiting for %s", path);
@@ -953,6 +1008,9 @@ int main(int argc, char **argv)
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	/* Metal's validation failures (MTLReportFailure) abort by default; one
+	   bad guest request must not take every process's GPU down: log them */
+	setenv("MTL_ERROR_MODE", "nslog", 0);
 
 	device = MTLCreateSystemDefaultDevice();
 	if (!device) {
@@ -960,7 +1018,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	hlog("host GPU: %s", device.name.UTF8String);
-	uint8_t *shm = map_shared(argv[1]);
+	uint8_t *shm = map_shared(argv[1], QMTL_PA, QMTL_SIZE, true);
 	if (shm == NULL) {
 		if (!stop) {
 			hlog("cannot map %s", argv[1]);
@@ -968,6 +1026,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	hlog("mapped %s (%d slots of %llu MiB)", argv[1], QMTL_SLOTS, QMTL_SLOT_SIZE >> 20);
+	uint8_t *surfaces = map_shared(argv[1], QMTL_POOL_PA, QMTL_POOL_SIZE, false);
+	pool = surfaces ? [device newBufferWithBytesNoCopy:surfaces length:QMTL_POOL_SIZE
+	    options:MTLResourceStorageModeShared deallocator:nil] : nil;
+	hlog("IOSurface pool: %s", pool ? "mapped (zero copy)" : "unavailable (surfaces are copied)");
 
 	NSMutableArray<Slot *> *slots = [NSMutableArray array];
 	for (int i = 0; i < QMTL_SLOTS; i++) {
@@ -981,7 +1043,7 @@ int main(int argc, char **argv)
 	}
 
 	uint64_t beat = 0;
-	time_t last_stats = time(NULL);
+	time_t last_stats = time(NULL), last_second = time(NULL);
 	while (!stop) {
 		bool worked = false;
 		beat++;
@@ -1022,12 +1084,25 @@ int main(int argc, char **argv)
 			h->host_heartbeat = beat;
 			worked |= serve(s);
 		}
+		if (time(NULL) != last_second) {
+			/* frames per second while something animates */
+			last_second = time(NULL);
+			for (Slot *s in slots) {
+				if (s->generation && s->commits != s->commits_last_second) {
+					hlog("slot %d: %llu commits/s", s->index, s->commits - s->commits_last_second);
+				}
+				s->commits_last_second = s->commits;
+			}
+		}
 		if (time(NULL) - last_stats >= 10) {
 			last_stats = time(NULL);
 			for (Slot *s in slots) {
 				if (s->generation && s->ops) {
-					hlog("slot %d (%.*s): %llu ops, %llu draws, %llu commits, %lu objects", s->index,
-					    (int)sizeof(s->h->name), s->h->name, s->ops, s->draws, s->commits, (unsigned long)s->objects.count);
+					uint64_t n = atomic_exchange(&s->done_cbs, 0), us = atomic_exchange(&s->gpu_us, 0);
+					uint64_t mx = atomic_exchange(&s->gpu_max_us, 0);
+					hlog("slot %d (%.*s): %llu ops, %llu draws, %llu commits, %lu objects; last 10 s: %llu done, "
+					    "commit->done avg %llu us max %llu us", s->index, (int)sizeof(s->h->name), s->h->name, s->ops,
+					    s->draws, s->commits, (unsigned long)s->objects.count, n, n ? us / n : 0, mx);
 				}
 			}
 		}

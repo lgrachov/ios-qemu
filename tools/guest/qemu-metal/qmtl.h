@@ -29,6 +29,11 @@
 #define QMTL_RING_SIZE		0x400000ULL	/* 4 MiB */
 #define QMTL_HEAP_OFFSET	(QMTL_HEADER_SIZE + QMTL_RING_SIZE)
 
+/* IOSurface pool (kernel patch 0105, SweetSurface.cpp): with sweetmetal=1
+   surfaces live here and the host renders into / samples them in place */
+#define QMTL_POOL_PA		0xb0000000ULL
+#define QMTL_POOL_SIZE		0x50000000ULL	/* 1.25 GiB, up to phys_base */
+
 #define QMTL_MAGIC		0x4c544d51	/* 'QMTL' */
 #define QMTL_VERSION		1
 
@@ -160,6 +165,8 @@ struct qmtl_texture_new {
 	uint64_t init_bpr, init_bpi;
 	uint32_t iosurface;		/* IOSurface id (for logs) */
 	uint32_t pad;
+	uint64_t pool_off;		/* surface in the pool: offset there, or ~0 */
+	uint64_t pool_bpr;
 };
 
 struct qmtl_texture_view {

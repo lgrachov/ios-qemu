@@ -21,6 +21,8 @@ void qlog(const char *fmt, ...) __printflike(1, 2);
 
 /* once per process and selector: "missing" methods we do not implement */
 void qmtl_log_selector(const char *kind, id obj, SEL sel);
+/* once per process and message */
+void qmtl_log_once(NSString *message);
 /* method signature from the Metal protocols the class adopts (forwarding) */
 NSMethodSignature *qmtl_signature(Class cls, SEL sel);
 /* add Metal protocols at runtime (NULL-terminated names) */
@@ -50,6 +52,13 @@ bool qmtl_cb_done(uint64_t serial, uint32_t *error);
 void qmtl_cb_wait(uint64_t serial);
 /* run block on the completion thread once serial is done */
 void qmtl_cb_notify(uint64_t serial, void (^block)(uint32_t error));
+
+/* IOSurface in the kernel's Metal surface pool (patch 0105): offset of the
+   plane's pixels in the pool and its row pitch; false if it is not there */
+bool qmtl_surface_pool(IOSurfaceRef surface, NSUInteger plane, uint64_t *offset, uint64_t *bpr);
+
+/* time spent waiting for the host in -commit (statistics) */
+void qmtl_note_commit(uint64_t wait_us);
 
 /* recorded MTLFunctionConstantValues (swizzled setters) */
 NSArray<NSData *> *qmtl_constants_of(MTLFunctionConstantValues *values);

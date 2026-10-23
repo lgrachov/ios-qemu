@@ -18,8 +18,9 @@ if xcrun -sdk macosx metal tools/host/qmtl-selftest.metal -o "$T/selftest.metall
 else
 	echo "no Metal toolchain: testing clear + blit only"
 fi
-# guest RAM 0x40000000.., Metal region at 0xa0000000 (qmtl.h): a sparse 1.75 GiB file
-mkfile -n 1792m "$T/ram"
+# guest RAM 0x40000000.., Metal region at 0xa0000000 and the IOSurface pool
+# up to 0x100000000 (qmtl.h): a sparse 3 GiB file
+mkfile -n 3072m "$T/ram"
 "$T/host" "$T/ram" > "$T/host.log" 2>&1 &
 HOST_PID=$!
 QMTL_TEST_FILE=$T/ram "$T/selftest" ${LIB[@]+"${LIB[@]}"} || { echo "--- host log"; cat "$T/host.log"; exit 1; }

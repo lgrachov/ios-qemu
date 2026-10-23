@@ -61,9 +61,13 @@ void qlog(const char *fmt, ...)
 
 void qmtl_log_selector(const char *kind, id obj, SEL sel)
 {
+	qmtl_log_once([NSString stringWithFormat:@"%s %s %@", kind, object_getClassName(obj), NSStringFromSelector(sel)]);
+}
+
+void qmtl_log_once(NSString *key)
+{
 	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 	static NSMutableSet<NSString *> *seen;
-	NSString *key = [NSString stringWithFormat:@"%s %@", object_getClassName(obj), NSStringFromSelector(sel)];
 	pthread_mutex_lock(&lock);
 	if (!seen) {
 		seen = [NSMutableSet new];
@@ -74,7 +78,7 @@ void qmtl_log_selector(const char *kind, id obj, SEL sel)
 	}
 	pthread_mutex_unlock(&lock);
 	if (first) {
-		qlog("%s %s", kind, key.UTF8String);
+		qlog("%s", key.UTF8String);
 	}
 }
 
@@ -127,6 +131,7 @@ void qmtl_adopt(Class cls, const char *const *protocols)
 
 static struct qmtl_slot *slot;
 static uint8_t *ring;
+static io_connect_t conn;
 static uint64_t sync_serial;
 static uint32_t last_id;
 static pthread_mutex_t ring_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -303,7 +308,8 @@ static void heap_reap(void)
 int64_t qmtl_heap_alloc(uint64_t size)
 {
 	uint64_t len = (size + HEAP_UNIT - 1) / HEAP_UNIT * HEAP_UNIT + HEAP_UNIT;
-	for (int attempt = 0; attempt < 2000; attempt++) {
+	/* waiting here stalls the caller (the render server): give up soon */
+	for (int attempt = 0; attempt < 40; attempt++) {
 		pthread_mutex_lock(&heap_lock);
 		heap_reap();
 		for (int i = 0; i < nfree; i++) {
@@ -534,6 +540,47 @@ static void hook_constant_values(void)
 	}
 }
 
+void qmtl_note_commit(uint64_t wait_us)
+{
+	static uint64_t n, total, worst, since;
+	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+	pthread_mutex_lock(&lock);
+	n++;
+	total += wait_us;
+	worst = MAX(worst, wait_us);
+	uint64_t now = now_ms();
+	if (since == 0) {
+		since = now;
+	}
+	if (now - since >= 5000) {
+		qlog("commits: %llu in %llu ms, wait for the GPU avg %llu us, max %llu us", n, now - since, total / n, worst);
+		n = total = worst = 0;
+		since = now;
+	}
+	pthread_mutex_unlock(&lock);
+}
+
+bool qmtl_surface_pool(IOSurfaceRef surface, NSUInteger plane, uint64_t *offset, uint64_t *bpr)
+{
+	if (conn == MACH_PORT_NULL) {
+		return false;
+	}
+	uint64_t in = IOSurfaceGetID(surface), out[4] = { 0 };
+	uint32_t n = 4;
+	if (IOConnectCallScalarMethod(conn, 1, &in, 1, out, &n) != KERN_SUCCESS || out[0] == 0) {
+		return false;
+	}
+	uint8_t *base = IOSurfaceGetBaseAddress(surface), *pixels = IOSurfaceGetBaseAddressOfPlane(surface, plane);
+	uint64_t pa = out[0] + out[3] + (uint64_t)(pixels - base);
+	*bpr = IOSurfaceGetBytesPerRowOfPlane(surface, plane);
+	/* what Metal's linear textures on the host accept */
+	if (pa < QMTL_POOL_PA || pa % 256 || *bpr % 64) {
+		return false;
+	}
+	*offset = pa - QMTL_POOL_PA;
+	return true;
+}
+
 /* ---- attach ---- */
 
 #ifdef QMTL_HOST_TEST
@@ -568,7 +615,6 @@ static bool attach_test(void)
 /* the kernel's IOAcceleratorES user client maps this process's slot */
 static bool attach_kernel(mach_port_t service)
 {
-	io_connect_t conn = MACH_PORT_NULL;
 	kern_return_t kr = IOServiceOpen(service, mach_task_self(), 0, &conn);
 	if (kr != KERN_SUCCESS) {
 		qlog("IOServiceOpen: 0x%x", kr);
@@ -580,6 +626,7 @@ static bool attach_kernel(mach_port_t service)
 	if (kr != KERN_SUCCESS) {
 		qlog("attach: 0x%x", kr);
 		IOServiceClose(conn);
+		conn = MACH_PORT_NULL;
 		return false;
 	}
 	/* conn stays open for the life of the process: closing frees the slot */
@@ -602,6 +649,24 @@ static bool attach(mach_port_t service)
 	memset((void *)slot->cb_done, 0, sizeof(slot->cb_done));
 	memset((void *)slot->cb_error, 0, sizeof(slot->cb_error));
 	heap_init();
+
+	/* how fast is the shared memory for the CPU (cached or not)? */
+	{
+		size_t n = 8 << 20;
+		void *plain = malloc(n);
+		uint8_t *shared = (uint8_t *)slot + QMTL_HEAP_OFFSET;
+		struct timespec a, b, c;
+		memset(plain, 1, n);
+		clock_gettime(CLOCK_MONOTONIC, &a);
+		memset(plain, 2, n);
+		clock_gettime(CLOCK_MONOTONIC, &b);
+		memset(shared, 2, n);
+		clock_gettime(CLOCK_MONOTONIC, &c);
+		double t1 = (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9;
+		double t2 = (c.tv_sec - b.tv_sec) + (c.tv_nsec - b.tv_nsec) / 1e9;
+		qlog("memset 8 MiB: ordinary memory %.0f MB/s, shared slot memory %.0f MB/s", n / t1 / 1e6, n / t2 / 1e6);
+		free(plain);
+	}
 
 	uint64_t start = now_ms();
 	struct qmtl_hello hello = { { QMTL_OP_HELLO, sizeof(hello) }, getpid(), 0 };

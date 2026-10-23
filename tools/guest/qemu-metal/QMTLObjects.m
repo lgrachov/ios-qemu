@@ -285,6 +285,7 @@ static uint32_t qid(id obj)
 	QMTLBuffer *_buffer;
 	NSUInteger _bufferOffset, _bufferBytesPerRow;
 	QMTLTexture *_parent;
+	BOOL _pooled;			/* surface in the pool: the host uses it in place */
 }
 @end
 
@@ -343,6 +344,7 @@ static void fill_desc(struct qmtl_texture_desc *d, MTLTextureDescriptor *desc)
 - (BOOL)isSparse { return NO; }
 - (NSUInteger)allocatedSize { return (NSUInteger)_d.width * _d.height * 4; }
 - (NSUInteger)rotation { return 0; }
+- (NSUInteger)protectionOptions { return 0; }
 - (id<MTLHeap>)heap { return nil; }
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
 - (MTLTextureSwizzleChannels)swizzle
@@ -445,6 +447,7 @@ static void fill_desc(struct qmtl_texture_desc *d, MTLTextureDescriptor *desc)
 	t->_d = _d;
 	t->_d.pixel_format = (uint32_t)format;
 	t->_parent = self;
+	t->_pooled = _pooled;
 	if (_surface) {
 		t->_surface = (IOSurfaceRef)CFRetain(_surface);
 		t->_plane = _plane;
@@ -463,6 +466,36 @@ static void fill_desc(struct qmtl_texture_desc *d, MTLTextureDescriptor *desc)
 
 @end
 
+/* bytes per pixel of the plain formats the pool path supports, else 0 */
+static uint32_t format_bpp(MTLPixelFormat f)
+{
+	switch (f) {
+	case MTLPixelFormatR8Unorm: case MTLPixelFormatA8Unorm: return 1;
+	case MTLPixelFormatRG8Unorm: case MTLPixelFormatR16Float: return 2;
+	case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
+	case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB:
+	case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatBGR10A2Unorm: case MTLPixelFormatR32Float: return 4;
+	case MTLPixelFormatRGBA16Float: return 8;
+	default: return 0;
+	}
+}
+
+/*
+ * The host aliases a pooled surface as a linear texture: only for a single
+ * plane whose rows hold the whole texture at the texture's pixel size
+ * (planar video formats and odd layouts keep the copy path).
+ */
+static bool pool_compatible(MTLTextureDescriptor *desc, IOSurfaceRef s, NSUInteger plane)
+{
+	uint32_t bpp = format_bpp(desc.pixelFormat);
+	size_t planes = IOSurfaceGetPlaneCount(s);
+	return bpp != 0 && plane == 0 && planes <= 1 && desc.textureType == MTLTextureType2D &&
+	    desc.mipmapLevelCount <= 1 && desc.sampleCount <= 1 &&
+	    IOSurfaceGetBytesPerElement(s) == bpp && IOSurfaceGetElementWidth(s) == 1 && IOSurfaceGetElementHeight(s) == 1 &&
+	    desc.width <= IOSurfaceGetWidth(s) && desc.height <= IOSurfaceGetHeight(s) &&
+	    desc.width * bpp <= IOSurfaceGetBytesPerRow(s);
+}
+
 static QMTLTexture *new_texture(MTLTextureDescriptor *desc, IOSurfaceRef surface, NSUInteger plane,
     QMTLBuffer *buffer, NSUInteger offset, NSUInteger bpr)
 {
@@ -470,15 +503,24 @@ static QMTLTexture *new_texture(MTLTextureDescriptor *desc, IOSurfaceRef surface
 	struct qmtl_texture_new c = { { QMTL_OP_TEXTURE_NEW, sizeof(c) }, t->_qid };
 	fill_desc(&t->_d, desc);
 	c.init_off = ~0ULL;
+	c.pool_off = ~0ULL;
 	if (surface) {
 		t->_surface = (IOSurfaceRef)CFRetain(surface);
 		t->_plane = plane;
-		uint64_t sbpr = 0;
-		int64_t off = [t stageSurface:&sbpr];
-		if (off >= 0) {
-			c.init_off = (uint64_t)off;
-			c.init_bpr = sbpr;
-			c.init_bpi = sbpr * t->_d.height;
+		if (pool_compatible(desc, surface, plane) && qmtl_surface_pool(surface, plane, &c.pool_off, &c.pool_bpr)) {
+			t->_pooled = YES;
+		} else {
+			uint32_t fmt = IOSurfaceGetPixelFormat(surface);
+			qmtl_log_once([NSString stringWithFormat:@"copied surface: %c%c%c%c planes %zu bpe %zu texture format %lu",
+			    fmt >> 24, fmt >> 16 & 0xff, fmt >> 8 & 0xff, fmt & 0xff, IOSurfaceGetPlaneCount(surface),
+			    IOSurfaceGetBytesPerElement(surface), (unsigned long)desc.pixelFormat]);
+			uint64_t sbpr = 0;
+			int64_t off = [t stageSurface:&sbpr];
+			if (off >= 0) {
+				c.init_off = (uint64_t)off;
+				c.init_bpr = sbpr;
+				c.init_bpi = sbpr * t->_d.height;
+			}
 		}
 		c.iosurface = IOSurfaceGetID(surface);
 		/* a surface is CPU-visible: keep the host copy readable */
@@ -528,6 +570,7 @@ static QMTLTexture *new_texture(MTLTextureDescriptor *desc, IOSurfaceRef surface
 	NSMutableArray *_scheduled, *_completed;
 	NSMutableSet<QMTLTexture *> *_sampledSurfaces, *_renderedSurfaces;
 	NSMutableSet<QMTLBuffer *> *_noCopyBuffers;
+	BOOL _rendersPooledSurface;
 	pthread_mutex_t _lock;
 	pthread_cond_t _cond;
 }
@@ -607,7 +650,9 @@ static QMTLTexture *new_texture(MTLTextureDescriptor *desc, IOSurfaceRef surface
 - (void)useTexture:(id)obj rendered:(BOOL)rendered
 {
 	QMTLTexture *t = [obj isKindOfClass:[QMTLTexture class]] ? obj : nil;
-	if (t && t->_surface) {
+	if (t && t->_pooled) {
+		_rendersPooledSurface |= rendered;
+	} else if (t && t->_surface) {
 		[(rendered ? _renderedSurfaces : _sampledSurfaces) addObject:t];
 	}
 }
@@ -714,6 +759,14 @@ static QMTLTexture *new_texture(MTLTextureDescriptor *desc, IOSurfaceRef surface
 		return;
 	}
 	free(staging);
+	struct timespec t0, t1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	if (_rendersPooledSurface) {
+		/* the display copies the surface right after this: let the GPU finish */
+		qmtl_cb_wait(_serial);
+	}
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	qmtl_note_commit((uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_nsec - t0.tv_nsec) / 1000));
 	QMTLCommandBuffer *me = self;
 	qmtl_cb_notify(_serial, ^(uint32_t e) { [me finishWithError:e]; });
 }
