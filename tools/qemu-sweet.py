@@ -348,6 +348,7 @@ def main():
     ap.add_argument('--hvf', action='store_true', help='hardware virtualization on Apple Silicon (-accel hvf -cpu host); needs an ADT from mkadt.py --hvf')
     ap.add_argument('--ufs', metavar='DISK', help='raw disk image (4 KiB-sector GPT, e.g. a "userdata" HFS+ partition) as a UFS LU; needs an ADT from mkadt.py --qemu-ufs and rd=ufsroot0')
     ap.add_argument('--fullfb', action='store_true', help='1125x2436 framebuffer (the whole iOS display, no crop); needs an ADT from mkadt.py --qemu-fullfb and kernel 0085')
+    ap.add_argument('--metal', metavar='FILE', help='back guest RAM with FILE (shared) for Metal remoting: tools/host/qemu-metal-host.m maps the region at boot-arg sweetmetal_pa from it (guest PA 0x40000000 = file offset 0)')
     ap.add_argument('--display', action='store_true', help='show the framebuffer live in a QEMU window (ramfb; needs clang)')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     a = ap.parse_args()
@@ -420,6 +421,11 @@ def main():
         # and its services as a USB peer (tools/ios-usbmuxd.py).
         fwd = f',hostfwd=tcp:127.0.0.1:{a.mux_port}-:62079' if a.mux_port else ''
         cmd += ['-netdev', f'user,id=net0{fwd}', '-device', 'virtio-net-device,netdev=net0']
+    if a.metal:
+        # stock QEMU on macOS has no ivshmem: share all of guest RAM through a file instead;
+        # the Metal region lies below the kernel's phys_base, which the kernel never manages
+        cmd[cmd.index('-M') + 1] += ',memory-backend=ram'
+        cmd += ['-object', f'memory-backend-file,id=ram,size={ram_gib}G,mem-path={os.path.abspath(a.metal)},share=on']
     if a.display:
         # the 1080x2400 panel is taller than most screens; zoom-to-fit scales the window.
         # show-cursor: with the virtio tablet QEMU hides the host cursor (iOS draws none)

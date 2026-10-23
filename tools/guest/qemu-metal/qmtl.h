@@ -4,9 +4,11 @@
  * the slot header, kernel patch 0104 (iokit/Kernel/arm/SweetMetal.cpp keeps
  * its own copy of the constants; keep them in sync).
  *
- * The shared region is QEMU's ivshmem-plain BAR2 (a host file mapped by
- * both QEMU and the host helper), placed by the boot stub at QMTL_PA. It is
- * split into QMTL_SLOTS slots; the kernel gives each process that opens the
+ * The shared region is guest RAM at QMTL_PA (boot-arg sweetmetal_pa), below
+ * the kernel's phys_base so the kernel never uses it for anything else.
+ * QEMU backs guest RAM with a shared file (qemu-sweet.py --metal) that the
+ * host helper maps too: guest PA QMTL_RAM_BASE = file offset 0. The region
+ * is split into QMTL_SLOTS slots; the kernel gives each process that opens the
  * IOAcceleratorES user client one slot and maps it into the process.
  *
  * Slot: [0, QMTL_HEADER_SIZE) header, [QMTL_HEADER_SIZE, +QMTL_RING_SIZE)
@@ -18,7 +20,8 @@
 
 #include <stdint.h>
 
-#define QMTL_PA			0x20000000ULL
+#define QMTL_RAM_BASE		0x40000000ULL	/* virt RAM start */
+#define QMTL_PA			0xa0000000ULL
 #define QMTL_SIZE		0x10000000ULL	/* 256 MiB */
 #define QMTL_SLOTS		8
 #define QMTL_SLOT_SIZE		(QMTL_SIZE / QMTL_SLOTS)	/* 32 MiB */

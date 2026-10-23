@@ -29,7 +29,7 @@ def run(*cmd, **kw):
 def build():
     os.makedirs(BUNDLE, exist_ok=True)
     run('xcrun', '-sdk', 'iphoneos', 'clang', '-arch', 'arm64', '-mios-version-min=16.0', '-fobjc-arc',
-        '-Os', '-Wall', '-bundle', '-framework', 'Foundation', '-framework', 'Metal',
+        '-Os', '-Wall', '-bundle', '-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOKit',
         '-o', os.path.join(BUNDLE, 'QEMUMetal'), os.path.join(SRC, 'QEMUMetal.m'))
     shutil.copyfile(os.path.join(SRC, 'Info.plist'), os.path.join(BUNDLE, 'Info.plist'))
     run('codesign', '-f', '-s', '-', BUNDLE, stderr=subprocess.DEVNULL)
