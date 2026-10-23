@@ -1,0 +1,79 @@
+diff --git a/iokit/Kernel/arm/SweetMetal.cpp b/iokit/Kernel/arm/SweetMetal.cpp
+new file mode 100644
+index 0000000..0391163
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetMetal.cpp
+@@ -0,0 +1,48 @@
++/*
++ * Metal device discovery marker for SWEET (boot-arg sweetmetal=1).
++ *
++ * iOS 16 Metal.framework (MTLRegisterDevices) walks
++ * IOServiceGetMatchingServices(IOServiceMatching("IOAcceleratorES")),
++ * reads MetalPluginName / MetalPluginClassName from each service, loads
++ * /System/Library/Extensions/<MetalPluginName>.bundle and creates the
++ * device with [[<MetalPluginClassName> alloc] initWithAcceleratorPort:
++ * service] (the class must be a subclass of _MTLDevice). This service only
++ * carries those two properties: there is no GPU and no user client; the
++ * guest bundle QEMUMetal does the rest in userland. Off by default, so
++ * without the boot-arg nothing changes and CoreAnimation keeps its CPU
++ * renderer.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++bool
++IOAcceleratorES::start(IOService *provider)
++{
++	uint32_t enabled = 0;
++
++	if (!PE_parse_boot_argn("sweetmetal", &enabled, sizeof(enabled)) || !enabled) {
++		return false;
++	}
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty("MetalPluginName", "QEMUMetal");
++	setProperty("MetalPluginClassName", "QEMUMTLDevice");
++	registerService();
++	IOLog("SWEET METAL: IOAcceleratorES registered (plugin QEMUMetal / QEMUMTLDevice)\n");
++	return true;
++}
++#endif /* SWEET */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 7e60aef..c6f58f7 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -92,6 +92,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = IOAcceleratorES;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IOAcceleratorES;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 48b674b..877c201 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -21,3 +21,4 @@ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitc
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
+ iokit/Kernel/arm/SweetNetworkStack.cpp                           optional iokitcpp
++iokit/Kernel/arm/SweetMetal.cpp                                  optional iokitcpp
