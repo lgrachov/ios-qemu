@@ -129,9 +129,13 @@ static uint32_t qid(id obj)
 - (id<MTLFunction>)makeFunction:(NSString *)name constants:(MTLFunctionConstantValues *)values error:(NSError **)error
 {
 	if (name == nil || _types[name] == nil) {
+		qlog("library %u has no function %s (%lu functions)", _qid, name.UTF8String ?: "(nil)", (unsigned long)_types.count);
 		return nil;
 	}
 	NSArray<NSData *> *constants = qmtl_constants_of(values);
+	if (values && constants.count == 0) {
+		qlog("function %s: constant values object %s recorded nothing", name.UTF8String, object_getClassName(values));
+	}
 	uint32_t size = qmtl_size((uint32_t)(sizeof(struct qmtl_function_new) + constants.count * sizeof(struct qmtl_constant)));
 	struct qmtl_function_new *c = calloc(1, size);
 	QMTLFunction *f = [[QMTLFunction alloc] initNew];
@@ -1183,6 +1187,54 @@ static void fill_attachment(struct qmtl_attachment *o, MTLRenderPassAttachmentDe
 - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDescriptor:(id)d { return [self computeCommandEncoder]; }
 @end
 
+/* ---- heaps: placement is not modelled, each resource stands alone ---- */
+
+@interface QMTLHeap : NSObject <MTLHeap> {
+@public
+	NSUInteger _size, _used;
+	MTLStorageMode _storage;
+	MTLCPUCacheMode _cpuCache;
+}
+@property (copy, atomic) NSString *label;
+@end
+
+@implementation QMTLHeap
++ (void)load { ADOPT("MTLHeap", "MTLHeapSPI"); }
+- (id<MTLDevice>)device { return qmtl_device; }
+- (MTLStorageMode)storageMode { return _storage; }
+- (MTLCPUCacheMode)cpuCacheMode { return _cpuCache; }
+- (MTLHazardTrackingMode)hazardTrackingMode { return MTLHazardTrackingModeTracked; }
+- (MTLResourceOptions)resourceOptions { return (MTLResourceOptions)_storage << MTLResourceStorageModeShift | _cpuCache; }
+- (MTLHeapType)type { return MTLHeapTypeAutomatic; }
+- (NSUInteger)size { return _size; }
+- (NSUInteger)usedSize { return MIN(_used, _size); }
+- (NSUInteger)currentAllocatedSize { return _size; }
+- (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment { return _size > _used ? _size - _used : 0; }
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
+
+- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
+{
+	_used += length;
+	return [qmtl_device newBufferWithLength:length options:options];
+}
+
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)desc
+{
+	_used += desc.width * desc.height * 4;
+	return [qmtl_device newTextureWithDescriptor:desc];
+}
+
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel
+{
+	return [super methodSignatureForSelector:sel] ?: qmtl_signature([self class], sel);
+}
+
+- (void)forwardInvocation:(NSInvocation *)inv
+{
+	qmtl_log_selector("missing", self, inv.selector);
+}
+@end
+
 /* ---- device: object creation ---- */
 
 static NSData *read_library(NSURL *url, NSError **error)
@@ -1208,17 +1260,21 @@ static id<MTLLibrary> new_library(NSData *data, NSString *what, NSError **error)
 	struct qmtl_library_new c = { { QMTL_OP_LIBRARY_NEW, sizeof(c) }, lib->_qid, 0, (uint64_t)off, data.length };
 	NSData *reply = nil;
 	bool ok = qmtl_call(&c, sizeof(c), &reply);
-	qmtl_heap_free_later(off);
-	if (!ok) {
+	if (!ok || reply.length < 8) {
+		qmtl_heap_free_later(off);
 		if (error) {
 			*error = qmtl_error(what, reply);
 		}
 		lib->_qid = 0;
 		return nil;
 	}
-	/* reply: "name\ttype\n" per function */
+	/* the host wrote "name\ttype\n" per function over the staging bytes */
+	uint64_t len = 0;
+	memcpy(&len, reply.bytes, 8);
+	NSString *text = [[NSString alloc] initWithBytes:qmtl_heap_ptr(off) length:MIN(len, (uint64_t)data.length)
+	    encoding:NSUTF8StringEncoding];
+	qmtl_heap_free_later(off);
 	NSMutableDictionary *types = [NSMutableDictionary dictionary];
-	NSString *text = [[NSString alloc] initWithData:reply encoding:NSUTF8StringEncoding];
 	for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
 		NSArray *f = [line componentsSeparatedByString:@"\t"];
 		if (f.count == 2) {
@@ -1226,9 +1282,6 @@ static id<MTLLibrary> new_library(NSData *data, NSString *what, NSError **error)
 		}
 	}
 	lib->_types = types;
-	if (types.count >= QMTL_REPLY_SIZE / 16) {
-		qlog("library %s: function list may be truncated (%lu)", what.UTF8String, (unsigned long)types.count);
-	}
 	return lib;
 }
 
@@ -1497,8 +1550,27 @@ static void fill_stencil(struct qmtl_stencil *o, MTLStencilDescriptor *s)
 
 - (id<MTLHeap>)newHeapWithDescriptor:(MTLHeapDescriptor *)d
 {
-	qmtl_log_selector("unsupported", self, _cmd);
-	return nil;
+	QMTLHeap *h = [QMTLHeap new];
+	h->_size = d.size;
+	h->_storage = d.storageMode;
+	h->_cpuCache = d.cpuCacheMode;
+	return h;
+}
+
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options
+{
+	return (MTLSizeAndAlign){ (length + 255) & ~255ul, 256 };
+}
+
+- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d
+{
+	NSUInteger size = d.width * d.height * MAX(d.depth, 1u) * MAX(d.arrayLength, 1u) * 16;
+	return (MTLSizeAndAlign){ (size + 16383) & ~16383ul, 16384 };
+}
+
+- (BOOL)supportsVertexAmplificationCount:(NSUInteger)count
+{
+	return count == 1;
 }
 
 - (id)newResourceGroupFromResources:(const id *)r count:(NSUInteger)n

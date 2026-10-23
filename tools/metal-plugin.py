@@ -52,6 +52,10 @@ def setup(disk):
             dst = os.path.join(mnt, GUEST_PATH)
             shutil.rmtree(dst, ignore_errors=True)
             shutil.copytree(BUNDLE, dst)
+            # one log per boot from here on
+            log = os.path.join(mnt, 'private/var/tmp/QEMUMetal.log')
+            if os.path.exists(log):
+                open(log, 'w').close()
             print(f'{disk}: /{GUEST_PATH} installed; boot with --bootargs "sweetmetal=1"')
         finally:
             run('umount', mnt)

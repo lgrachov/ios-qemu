@@ -23,6 +23,7 @@
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <objc/runtime.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -64,6 +65,20 @@ static void hlog(const char *fmt, ...)
 @end
 @implementation HBuffer
 @end
+
+/* a linear texture the host GPU cannot alias in place (row pitch or offset
+   not aligned for it): an ordinary texture refreshed from the guest buffer's
+   bytes whenever it is bound */
+@interface HLinear : NSObject {
+@public
+	uint64_t off, bpr;
+	NSUInteger width, height;
+}
+@end
+@implementation HLinear
+@end
+
+static const void *linear_key = &linear_key;
 
 /* a guest command buffer and the IOSurface read-backs it asked for */
 @interface HCommandBuffer : NSObject {
@@ -185,7 +200,19 @@ static void op_texture_new(Slot *s, const struct qmtl_texture_new *c)
 		GET(HBuffer *, b, s, c->buffer, "texture on buffer");
 		if (b) {
 			d.storageMode = MTLStorageModeShared;
-			t = [s->heap newTextureWithDescriptor:d offset:heap_rel(b->off) + c->buffer_offset bytesPerRow:c->bytes_per_row];
+			NSUInteger align = [device minimumLinearTextureAlignmentForPixelFormat:d.pixelFormat];
+			uint64_t off = heap_rel(b->off) + c->buffer_offset;
+			if (align && off % align == 0 && c->bytes_per_row % MAX(align, 16u) == 0) {
+				t = [s->heap newTextureWithDescriptor:d offset:off bytesPerRow:c->bytes_per_row];
+			} else if (in_heap(b->off + c->buffer_offset, c->bytes_per_row * d.height)) {
+				t = [device newTextureWithDescriptor:d];
+				HLinear *l = [HLinear new];
+				l->off = b->off + c->buffer_offset;
+				l->bpr = c->bytes_per_row;
+				l->width = d.width;
+				l->height = d.height;
+				objc_setAssociatedObject(t, linear_key, l, OBJC_ASSOCIATION_RETAIN);
+			}
 		}
 	} else {
 		t = [device newTextureWithDescriptor:d];
@@ -267,12 +294,15 @@ static void op_library_new(Slot *s, const struct qmtl_library_new *c)
 		[list appendFormat:@"%@\t%lu\n", name, (unsigned long)(f ? f.functionType : 0)];
 	}
 	s->objects[@(c->id)] = lib;
+	/* the list goes over the (now consumed) library bytes in staging */
 	NSData *d = [list dataUsingEncoding:NSUTF8StringEncoding];
-	if (d.length > QMTL_REPLY_SIZE) {
-		hlog("slot %d: library function list truncated (%lu bytes)", s->index, (unsigned long)d.length);
+	uint64_t len = MIN((uint64_t)d.length, c->length);
+	if (len < d.length) {
+		hlog("slot %d: library %u: function list truncated (%lu bytes)", s->index, c->id, (unsigned long)d.length);
 	}
+	memcpy(heap_ptr(s, c->staging_off), d.bytes, len);
 	hlog("slot %d: library %u: %lu functions", s->index, c->id, (unsigned long)lib.functionNames.count);
-	reply(s, 0, d.bytes, (uint32_t)d.length);
+	reply(s, 0, &len, sizeof(len));
 }
 
 static void op_function_new(Slot *s, const struct qmtl_function_new *c)
@@ -287,6 +317,13 @@ static void op_function_new(Slot *s, const struct qmtl_function_new *c)
 	id<MTLFunction> f;
 	if (c->nconstants == 0) {
 		f = [lib newFunctionWithName:name];
+		/* Metal asserts (aborts) when a pipeline uses an unspecialised function */
+		for (MTLFunctionConstant *k in f.functionConstantsDictionary.allValues) {
+			if (k.required) {
+				reply_error(s, [NSString stringWithFormat:@"function %@: constant %@ required but none given", name, k.name]);
+				return;
+			}
+		}
 	} else {
 		MTLFunctionConstantValues *v = [MTLFunctionConstantValues new];
 		for (uint32_t i = 0; i < c->nconstants; i++) {
@@ -560,6 +597,10 @@ static void op_set_texture(Slot *s, const struct qmtl_set_texture *c)
 {
 	id e = obj(s, c->enc);
 	id<MTLTexture> t = obj(s, c->texture);
+	HLinear *l = t ? objc_getAssociatedObject(t, linear_key) : nil;
+	if (l) {
+		[t replaceRegion:MTLRegionMake2D(0, 0, l->width, l->height) mipmapLevel:0 withBytes:heap_ptr(s, l->off) bytesPerRow:l->bpr];
+	}
 	switch (c->stage) {
 	case QMTL_STAGE_VERTEX: [(id<MTLRenderCommandEncoder>)e setVertexTexture:t atIndex:c->index]; break;
 	case QMTL_STAGE_FRAGMENT: [(id<MTLRenderCommandEncoder>)e setFragmentTexture:t atIndex:c->index]; break;

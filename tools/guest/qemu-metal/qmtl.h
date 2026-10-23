@@ -90,7 +90,8 @@ enum {
 	QMTL_OP_TEXTURE_VIEW,
 	QMTL_OP_TEXTURE_REPLACE,
 	QMTL_OP_TEXTURE_READ,		/* host writes staging; guest SYNCs */
-	QMTL_OP_LIBRARY_NEW,		/* REPLY: function list "name\ttype\n" */
+	QMTL_OP_LIBRARY_NEW,		/* REPLY: u64 length of the function list
+					   "name\ttype\n" the host wrote over the staging bytes */
 	QMTL_OP_FUNCTION_NEW,		/* REPLY */
 	QMTL_OP_RENDER_PIPELINE_NEW,	/* REPLY */
 	QMTL_OP_COMPUTE_PIPELINE_NEW,	/* REPLY: u32 maxTotalThreadsPerThreadgroup, threadExecutionWidth */

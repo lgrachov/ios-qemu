@@ -482,7 +482,9 @@ NSArray<NSData *> *qmtl_constants_of(MTLFunctionConstantValues *values)
 
 static void hook_constant_values(void)
 {
-	Class cls = objc_getClass("MTLFunctionConstantValues");
+	/* iOS: +alloc returns the private MTLFunctionConstantValuesInternal,
+	   which has its own setters */
+	Class cls = [[MTLFunctionConstantValues new] class];
 	SEL s1 = @selector(setConstantValue:type:atIndex:);
 	SEL s2 = @selector(setConstantValues:type:withRange:);
 	SEL s3 = @selector(setConstantValue:type:withName:);
@@ -509,6 +511,27 @@ static void hook_constant_values(void)
 		record_constant(self, v, t, ~0u, n);
 		o3(self, s3, v, t, n);
 	}));
+	/* descriptors copy their constantValues: carry the record over */
+	SEL s4 = @selector(copyWithZone:), s5 = @selector(reset);
+	Method m4 = class_getInstanceMethod(cls, s4), m5 = class_getInstanceMethod(cls, s5);
+	id (*o4)(id, SEL, NSZone *) = (void *)method_getImplementation(m4);
+	void (*o5)(id, SEL) = (void *)method_getImplementation(m5);
+	method_setImplementation(m4, imp_implementationWithBlock(^id(id self, NSZone *zone) {
+		id copy = o4(self, s4, zone);
+		NSArray *list = qmtl_constants_of(self);
+		if (copy && list.count) {
+			objc_setAssociatedObject(copy, constants_key, [list mutableCopy], OBJC_ASSOCIATION_RETAIN);
+		}
+		return copy;
+	}));
+	if (m5) {
+		method_setImplementation(m5, imp_implementationWithBlock(^(id self) {
+			@synchronized (self) {
+				objc_setAssociatedObject(self, constants_key, nil, OBJC_ASSOCIATION_RETAIN);
+			}
+			o5(self, s5);
+		}));
+	}
 }
 
 /* ---- attach ---- */
@@ -603,12 +626,37 @@ __attribute__((constructor)) static void loaded(void)
 
 @implementation QEMUMTLDevice
 
+/*
+ * Processes that get the device. For now only CoreAnimation's render server:
+ * other clients (SpringBoard's Metal Performance Shaders, widgets) abort on
+ * a device they do not know, so they keep seeing no Metal device, as before.
+ */
+static bool process_allowed(void)
+{
+	static const char *const allowed[] = { "backboardd", "selftest", NULL };
+	const char *name = getprogname();
+	for (const char *const *a = allowed; *a; a++) {
+		if (name && strcmp(name, *a) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 - (instancetype)initWithAcceleratorPort:(mach_port_t)port
 {
+	/* always: a rejected instance is still deallocated through _MTLDevice,
+	   whose dealloc releases what -init created */
+	if (!(self = [super init])) {
+		return nil;
+	}
+	if (!process_allowed()) {
+		return nil;
+	}
 	if (qmtl_device != nil) {
 		return qmtl_device;	/* one device (and slot) per process */
 	}
-	if ((slot == NULL && !attach(port)) || !(self = [super init])) {
+	if (slot == NULL && !attach(port)) {
 		return nil;	/* no host: no Metal device, CoreAnimation keeps its CPU renderer */
 	}
 	qmtl_device = self;
