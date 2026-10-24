@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>com.ios-qemu.QEMUMetal</string>
+	<string>cx.lev.ios-qemu.QEMUMetal</string>
 	<key>CFBundleExecutable</key>
 	<string>QEMUMetal</string>
 	<key>CFBundleName</key>

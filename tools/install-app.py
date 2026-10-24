@@ -27,9 +27,10 @@ GUEST_ENTS = os.path.join(ROOT, 'tools/guest/entitlements.plist')
 GUEST_BIN = os.path.join(ROOT, 'research/guest/qemu-appinstalld')
 GUEST_PATH = 'usr/local/libexec/qemu-appinstalld'
 GUEST_PORT = 62080
-JOB_KEY = '/System/Library/LaunchDaemons/com.ios-qemu.appinstalld.plist'
+JOB_KEY = '/System/Library/LaunchDaemons/cx.lev.ios-qemu.appinstalld.plist'
+OLD_JOB_KEY = '/System/Library/LaunchDaemons/com.ios-qemu.appinstalld.plist'
 JOB = {
-    'Label': 'com.ios-qemu.appinstalld',
+    'Label': 'cx.lev.ios-qemu.appinstalld',
     'ProgramArguments': ['/' + GUEST_PATH],
     'inetdCompatibility': {'Wait': False},
     'Sockets': {'Listener': {'SockNodeName': '127.0.0.1', 'SockServiceName': str(GUEST_PORT),
@@ -83,6 +84,8 @@ def setup(disk):
             # edit launchd.plist in place: same inode keeps its owner and mode
             with open(os.path.join(mnt, 'System/Library/xpc/launchd.plist'), 'r+b') as f:
                 plist = plistlib.load(f)
+                # the job's name before the cx.lev.ios-qemu rename: same socket, drop it
+                plist['LaunchDaemons'].pop(OLD_JOB_KEY, None)
                 plist['LaunchDaemons'][JOB_KEY] = JOB
                 f.seek(0)
                 f.write(plistlib.dumps(plist, fmt=plistlib.FMT_BINARY))

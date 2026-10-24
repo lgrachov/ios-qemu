@@ -407,7 +407,7 @@ void qmtl_cb_notify(uint64_t serial, void (^block)(uint32_t error))
 static void *completion_thread(void *arg)
 {
 	(void)arg;
-	pthread_setname_np("com.ios-qemu.metal.completion");
+	pthread_setname_np("cx.lev.ios-qemu.metal.completion");
 	for (;;) {
 		NSMutableArray *ready = [NSMutableArray array];
 		pthread_mutex_lock(&done_lock);

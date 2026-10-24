@@ -9,7 +9,7 @@
 	<key>CFBundleExecutable</key>
 	<string>VTTest</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.ios-qemu.vttest</string>
+	<string>cx.lev.ios-qemu.vttest</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>

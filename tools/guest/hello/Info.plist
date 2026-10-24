@@ -9,7 +9,7 @@
 	<key>CFBundleExecutable</key>
 	<string>HelloQEMU</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.ios-qemu.hello</string>
+	<string>cx.lev.ios-qemu.hello</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
