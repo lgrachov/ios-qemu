@@ -11,7 +11,12 @@
  * only accepts a codec that also has input streams (SubPortPolicy.cpp: "The
  * HAL returned input stream size of %u"), so there is a microphone stream
  * too; it records silence. It also needs output volume and mute: the HAL
- * answers a device's 'vold'/'mute' from its control objects.
+ * answers a device's 'vold'/'mute' from its control objects. VirtualAudio
+ * makes its ports (built-in mic, speaker, ...) from the codec's data sources
+ * ('ssc#' per scope, from data source controls), one per source ID: input
+ * sources become microphone ports. Output ports are announced differently:
+ * Device_Codec_Aspen checks for a 'mute' control on output element 4
+ * (speaker) and 3 (receiver), and each port has its own volume.
  *
  * Step 1: the device runs on its own clock (host time at 48 kHz) and only
  * measures what it is given (peak level once a second in the log). Step 2
@@ -36,6 +41,9 @@
 enum {
 	kObjPlugIn = kAudioObjectPlugInObject, kObjDevice = 2, kObjOutStream = 3, kObjInStream = 4,
 	kObjVolume = 5, kObjMute = 6,	/* output volume and mute controls */
+	kObjInSource = 7, kObjOutSource = 8,	/* data sources: VirtualAudio's ports */
+	kObjSpeakerMute = 9, kObjReceiverMute = 10,	/* output port mutes */
+	kObjSpeakerVolume = 11, kObjReceiverVolume = 12,	/* output port volumes */
 };
 
 #define RATE		48000.0
@@ -53,8 +61,24 @@ static UInt64 anchor_time, period_count;
 static UInt32 seed = 1;
 static Float32 peak;
 static UInt64 frames_seen, last_report;
-static Float32 volume_db;		/* MIN_DB..0 */
-static UInt32 muted;
+/* volume and mute per output element: main, receiver, speaker */
+static const AudioObjectPropertyElement port_element[3] = { kAudioObjectPropertyElementMain, 3, 4 };
+static Float32 volume_db[3];		/* MIN_DB..0 */
+static UInt32 muted[3];
+
+static int volume_port(AudioObjectID o)
+{
+	return o == kObjVolume ? 0 : o == kObjReceiverVolume ? 1 : o == kObjSpeakerVolume ? 2 : -1;
+}
+
+static int mute_port(AudioObjectID o)
+{
+	return o == kObjMute ? 0 : o == kObjReceiverMute ? 1 : o == kObjSpeakerMute ? 2 : -1;
+}
+
+/* data source IDs (4cc, port subtypes as VirtualAudio names them) */
+#define SRC_IN		'imic'		/* built-in microphone */
+#define SRC_OUT		'spkr'		/* speaker */
 
 static void qlog(const char *fmt, ...)
 {
@@ -115,6 +139,102 @@ static AudioStreamBasicDescription stream_format(void)
 	};
 }
 
+/*
+ * Diagnostics (QEMUAUDIO_TRACE_VA): VirtualAudio.plugin's property reads of
+ * our device fail inside the HAL without reaching us. Point VirtualAudio's
+ * imports of the AudioObject* property calls at wrappers that log every
+ * failure. Its __got holds plain pointers (arm64, no PAC).
+ */
+#define QEMUAUDIO_TRACE_VA 1
+#if QEMUAUDIO_TRACE_VA
+#include <dlfcn.h>
+#include <mach/mach.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
+
+static OSStatus (*real_get)(AudioObjectID, const AudioObjectPropertyAddress *, UInt32, const void *, UInt32 *, void *);
+static OSStatus (*real_size)(AudioObjectID, const AudioObjectPropertyAddress *, UInt32, const void *, UInt32 *);
+static OSStatus (*real_set)(AudioObjectID, const AudioObjectPropertyAddress *, UInt32, const void *, UInt32, const void *);
+static Boolean (*real_has)(AudioObjectID, const AudioObjectPropertyAddress *);
+
+static void va_fail(const char *call, AudioObjectID obj, const AudioObjectPropertyAddress *a, OSStatus err)
+{
+	char s[8], sc[8], e[8];
+	qlog("VA %s(object %u, '%s', '%s', element %u) -> '%s' (%d)", call, obj, fourcc(a->mSelector, s),
+	     fourcc(a->mScope, sc), a->mElement, fourcc((UInt32)err, e), (int)err);
+}
+
+static OSStatus va_get(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 *sz, void *d)
+{
+	OSStatus err = real_get(o, a, qs, q, sz, d);
+	if (err)
+		va_fail("GetPropertyData", o, a, err);
+	return err;
+}
+
+static OSStatus va_size(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 *sz)
+{
+	OSStatus err = real_size(o, a, qs, q, sz);
+	if (err)
+		va_fail("GetPropertyDataSize", o, a, err);
+	return err;
+}
+
+static OSStatus va_set(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 qs, const void *q, UInt32 sz, const void *d)
+{
+	OSStatus err = real_set(o, a, qs, q, sz, d);
+	if (err)
+		va_fail("SetPropertyData", o, a, err);
+	return err;
+}
+
+static Boolean va_has(AudioObjectID o, const AudioObjectPropertyAddress *a)
+{
+	Boolean r = real_has(o, a);
+	if (!r && o >= 50 && o < 70)	/* only physical devices and their objects */
+		va_fail("HasProperty", o, a, 0);
+	return r;
+}
+
+static void *trace_fn[4], *trace_wrap[4] = { va_get, va_size, va_set, va_has };
+
+static void trace_image(const struct mach_header *mh, intptr_t slide)
+{
+	Dl_info info;
+	if (!dladdr(mh, &info) || !info.dli_fname || !strstr(info.dli_fname, "/VirtualAudio.plugin/"))
+		return;
+	unsigned long size;
+	uint8_t *got = getsectiondata((const struct mach_header_64 *)mh, "__DATA_CONST", "__got", &size);
+	if (!got)
+		got = getsectiondata((const struct mach_header_64 *)mh, "__DATA", "__got", &size);
+	if (!got) {
+		qlog("trace: no __got in VirtualAudio");
+		return;
+	}
+	vm_address_t page = (vm_address_t)got & ~(vm_page_size - 1);
+	vm_size_t len = (vm_address_t)got + size - page;
+	kern_return_t kr = vm_protect(mach_task_self(), page, len, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+	int n = 0;
+	for (void **p = (void **)got; kr == KERN_SUCCESS && (uint8_t *)p < got + size; p++)
+		for (int k = 0; k < 4; k++)
+			if (trace_fn[k] && *p == trace_fn[k]) {
+				*p = trace_wrap[k];
+				n++;
+			}
+	vm_protect(mach_task_self(), page, len, false, VM_PROT_READ);
+	qlog("trace: %d VirtualAudio imports wrapped (vm_protect %d)", n, kr);
+}
+
+static void trace_va(void)
+{
+	trace_fn[0] = real_get = dlsym(RTLD_DEFAULT, "AudioObjectGetPropertyData");
+	trace_fn[1] = real_size = dlsym(RTLD_DEFAULT, "AudioObjectGetPropertyDataSize");
+	trace_fn[2] = real_set = dlsym(RTLD_DEFAULT, "AudioObjectSetPropertyData");
+	trace_fn[3] = real_has = dlsym(RTLD_DEFAULT, "AudioObjectHasProperty");
+	_dyld_register_func_for_add_image(trace_image);	/* also runs for images already loaded */
+}
+#endif
+
 /* ---- IUnknown ---- */
 
 static AudioServerPlugInDriverInterface iface;
@@ -148,6 +268,9 @@ static OSStatus Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRe
 	mach_timebase_info(&tb);
 	ticks_per_frame = 1e9 / RATE * tb.denom / tb.numer;
 	qlog("initialized: device '%s', %d ch, %.0f Hz", DEVICE_UID, CHANNELS, RATE);
+#if QEMUAUDIO_TRACE_VA
+	trace_va();
+#endif
 	return noErr;
 }
 
@@ -203,11 +326,19 @@ static OSStatus IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectID o
 		       a->mSelector == kAudioStreamPropertyPhysicalFormat;
 		break;
 	case kObjVolume:
+	case kObjSpeakerVolume:
+	case kObjReceiverVolume:
 		*out = a->mSelector == kAudioLevelControlPropertyScalarValue ||
 		       a->mSelector == kAudioLevelControlPropertyDecibelValue;
 		break;
 	case kObjMute:
+	case kObjSpeakerMute:
+	case kObjReceiverMute:
 		*out = a->mSelector == kAudioBooleanControlPropertyValue;
+		break;
+	case kObjInSource:
+	case kObjOutSource:
+		*out = a->mSelector == kAudioSelectorControlPropertyCurrentItem;
 		break;
 	default:
 		*out = false;
@@ -273,30 +404,30 @@ static UInt32 get(AudioObjectID obj, const AudioObjectPropertyAddress *a, UInt32
 				memcpy(buf, ids, n);
 			}
 			break;
-		case kAudioObjectPropertyOwnedObjects: {
-			AudioObjectID ids[4] = { kObjOutStream, kObjInStream, kObjVolume, kObjMute };
-			if (a->mScope == kAudioObjectPropertyScopeInput)
-				VAL(AudioObjectID, kObjInStream);
-			else if (a->mScope == kAudioObjectPropertyScopeOutput) {
-				ids[1] = kObjVolume;
-				ids[2] = kObjMute;
-				n = 3 * sizeof(AudioObjectID);
-				memcpy(buf, ids, n);
-			} else {
-				n = sizeof(ids);
-				memcpy(buf, ids, n);
+		case kAudioObjectPropertyOwnedObjects:
+		case kAudioObjectPropertyControlList: {
+			/* every object the device owns, by scope; ControlList leaves out the streams */
+			static const struct { AudioObjectID id; Boolean input, control; } owned[] = {
+				{ kObjOutStream, false, false }, { kObjInStream, true, false },
+				{ kObjVolume, false, true }, { kObjMute, false, true },
+				{ kObjSpeakerMute, false, true }, { kObjReceiverMute, false, true },
+				{ kObjSpeakerVolume, false, true }, { kObjReceiverVolume, false, true },
+				{ kObjInSource, true, true }, { kObjOutSource, false, true },
+			};
+			AudioObjectID ids[10];
+			UInt32 count = 0;
+			for (unsigned i = 0; i < sizeof(owned) / sizeof(owned[0]); i++) {
+				if (a->mSelector == kAudioObjectPropertyControlList && !owned[i].control)
+					continue;
+				if ((a->mScope == kAudioObjectPropertyScopeInput && !owned[i].input) ||
+				    (a->mScope == kAudioObjectPropertyScopeOutput && owned[i].input))
+					continue;
+				ids[count++] = owned[i].id;
 			}
+			n = count ? count * sizeof(AudioObjectID) : EMPTY;
+			memcpy(buf, ids, count * sizeof(AudioObjectID));
 			break;
 		}
-		case kAudioObjectPropertyControlList:
-			if (a->mScope == kAudioObjectPropertyScopeInput)
-				n = EMPTY;
-			else {
-				AudioObjectID ids[2] = { kObjVolume, kObjMute };
-				n = sizeof(ids);
-				memcpy(buf, ids, n);
-			}
-			break;
 		case kAudioDevicePropertyNominalSampleRate: VAL(Float64, RATE); break;
 		case kAudioDevicePropertyAvailableNominalSampleRates:
 			VAL(AudioValueRange, ((AudioValueRange){ RATE, RATE }));
@@ -349,8 +480,13 @@ static UInt32 get(AudioObjectID obj, const AudioObjectPropertyAddress *a, UInt32
 		break;
 	}
 	case kObjVolume:
-	case kObjMute: {
-		Boolean vol = obj == kObjVolume;
+	case kObjMute:
+	case kObjSpeakerMute:
+	case kObjReceiverMute:
+	case kObjSpeakerVolume:
+	case kObjReceiverVolume: {
+		int vp = volume_port(obj), mp = mute_port(obj);
+		Boolean vol = vp >= 0;
 		switch (a->mSelector) {
 		case kAudioObjectPropertyBaseClass:
 			VAL(AudioClassID, vol ? kAudioLevelControlClassID : kAudioBooleanControlClassID);
@@ -359,14 +495,16 @@ static UInt32 get(AudioObjectID obj, const AudioObjectPropertyAddress *a, UInt32
 		case kAudioObjectPropertyOwner: VAL(AudioObjectID, kObjDevice); break;
 		case kAudioObjectPropertyOwnedObjects: n = EMPTY; break;
 		case kAudioControlPropertyScope: VAL(AudioObjectPropertyScope, kAudioObjectPropertyScopeOutput); break;
-		case kAudioControlPropertyElement: VAL(AudioObjectPropertyElement, kAudioObjectPropertyElementMain); break;
+		case kAudioControlPropertyElement:
+			VAL(AudioObjectPropertyElement, port_element[vol ? vp : mp]);
+			break;
 		}
 		if (n)
 			break;
 		if (vol)
 			switch (a->mSelector) {
-			case kAudioLevelControlPropertyScalarValue: VAL(Float32, 1.0f - volume_db / MIN_DB); break;
-			case kAudioLevelControlPropertyDecibelValue: VAL(Float32, volume_db); break;
+			case kAudioLevelControlPropertyScalarValue: VAL(Float32, 1.0f - volume_db[vp] / MIN_DB); break;
+			case kAudioLevelControlPropertyDecibelValue: VAL(Float32, volume_db[vp]); break;
 			case kAudioLevelControlPropertyDecibelRange:
 				VAL(AudioValueRange, ((AudioValueRange){ MIN_DB, 0 }));
 				break;
@@ -375,7 +513,26 @@ static UInt32 get(AudioObjectID obj, const AudioObjectPropertyAddress *a, UInt32
 			case kAudioLevelControlPropertyConvertDecibelsToScalar: VAL(Float32, 0); break;
 			}
 		else if (a->mSelector == kAudioBooleanControlPropertyValue)
-			VAL(UInt32, muted);
+			VAL(UInt32, muted[mp]);
+		break;
+	}
+	case kObjInSource:
+	case kObjOutSource: {
+		Boolean in = obj == kObjInSource;
+		switch (a->mSelector) {
+		case kAudioObjectPropertyBaseClass: VAL(AudioClassID, kAudioSelectorControlClassID); break;
+		case kAudioObjectPropertyClass: VAL(AudioClassID, kAudioDataSourceControlClassID); break;
+		case kAudioObjectPropertyOwner: VAL(AudioObjectID, kObjDevice); break;
+		case kAudioObjectPropertyOwnedObjects: n = EMPTY; break;
+		case kAudioControlPropertyScope:
+			VAL(AudioObjectPropertyScope, in ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput);
+			break;
+		case kAudioControlPropertyElement: VAL(AudioObjectPropertyElement, kAudioObjectPropertyElementMain); break;
+		case kAudioSelectorControlPropertyCurrentItem:
+		case kAudioSelectorControlPropertyAvailableItems: VAL(UInt32, in ? SRC_IN : SRC_OUT); break;
+		/* the item ID arrives as the qualifier; answered by the caller */
+		case kAudioSelectorControlPropertyItemName: STR(""); break;
+		}
 		break;
 	}
 	}
@@ -421,7 +578,18 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obj,
 		*outsize = sizeof(dev);
 		return noErr;
 	}
-	if (obj == kObjVolume && (a->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ||
+	if ((obj == kObjInSource || obj == kObjOutSource) && a->mSelector == kAudioSelectorControlPropertyItemName) {
+		UInt32 id = qsize >= sizeof(UInt32) ? *(const UInt32 *)q : 0;
+		CFStringRef name = id == SRC_IN ? CFSTR("Microphone") : id == SRC_OUT ? CFSTR("Speaker") : NULL;
+		if (!name)
+			return kAudioHardwareIllegalOperationError;
+		if (size < sizeof(name))
+			return kAudioHardwareBadPropertySizeError;
+		*(CFStringRef *)out = CFRetain(name);
+		*outsize = sizeof(name);
+		return noErr;
+	}
+	if (volume_port(obj) >= 0 && (a->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ||
 				  a->mSelector == kAudioLevelControlPropertyConvertDecibelsToScalar)) {
 		if (size < sizeof(Float32))
 			return kAudioHardwareBadPropertySizeError;
@@ -468,27 +636,35 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obj,
 			return noErr;
 		return kAudioDeviceUnsupportedFormatError;
 	}
-	if (size >= sizeof(Float32) && obj == kObjVolume &&
+	if (size >= sizeof(Float32) && volume_port(obj) >= 0 &&
 	    (a->mSelector == kAudioLevelControlPropertyScalarValue ||
 	     a->mSelector == kAudioLevelControlPropertyDecibelValue)) {
 		Float32 v = *(const Float32 *)data;
-		volume_db = a->mSelector == kAudioLevelControlPropertyDecibelValue ?
+		Float32 *db = &volume_db[volume_port(obj)];
+		*db = a->mSelector == kAudioLevelControlPropertyDecibelValue ?
 		    fminf(fmaxf(v, MIN_DB), 0) : (1.0f - fminf(fmaxf(v, 0), 1)) * MIN_DB;
 		AudioObjectPropertyAddress ch[2] = {
 			{ kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
 			{ kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
 		};
-		host->PropertiesChanged(host, kObjVolume, 2, ch);
-		qlog("volume %.1f dB", volume_db);
+		host->PropertiesChanged(host, obj, 2, ch);
+		qlog("volume %u = %.1f dB", obj, *db);
 		return noErr;
 	}
-	if (size >= sizeof(UInt32) && obj == kObjMute && a->mSelector == kAudioBooleanControlPropertyValue) {
-		muted = *(const UInt32 *)data != 0;
+	if (size >= sizeof(UInt32) && mute_port(obj) >= 0 &&
+	    a->mSelector == kAudioBooleanControlPropertyValue) {
+		UInt32 *v = &muted[mute_port(obj)];
+		*v = *(const UInt32 *)data != 0;
 		AudioObjectPropertyAddress ch = { kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal,
 						  kAudioObjectPropertyElementMain };
-		host->PropertiesChanged(host, kObjMute, 1, &ch);
-		qlog("mute %u", muted);
+		host->PropertiesChanged(host, obj, 1, &ch);
+		qlog("mute %u = %u", obj, *v);
 		return noErr;
+	}
+	if ((obj == kObjInSource || obj == kObjOutSource) && a->mSelector == kAudioSelectorControlPropertyCurrentItem) {
+		/* one source per direction: only it can be selected */
+		UInt32 want = obj == kObjInSource ? SRC_IN : SRC_OUT;
+		return size >= sizeof(UInt32) && *(const UInt32 *)data == want ? noErr : kAudioHardwareIllegalOperationError;
 	}
 	unknown(obj, a, "SetPropertyData");
 	return kAudioHardwareUnknownPropertyError;

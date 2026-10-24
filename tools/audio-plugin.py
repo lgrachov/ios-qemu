@@ -31,7 +31,7 @@ def run(*cmd, **kw):
 
 def build():
     os.makedirs(BUNDLE, exist_ok=True)
-    run('xcrun', '-sdk', 'iphoneos', 'clang', '-arch', 'arm64', '-mios-version-min=16.0', '-Os', '-Wall',
+    run('xcrun', '-sdk', 'iphoneos', 'clang', '-arch', 'arm64', '-mios-version-min=16.0', '-Os', '-Wall', '-Wno-four-char-constants',
         '-bundle', '-framework', 'CoreFoundation', '-o', os.path.join(BUNDLE, 'QEMUAudio'),
         os.path.join(SRC, 'QEMUAudio.c'))
     shutil.copyfile(os.path.join(SRC, 'Info.plist'), os.path.join(BUNDLE, 'Info.plist'))
