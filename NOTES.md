@@ -4,6 +4,9 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> hackios (oosexgang) GPU check, 2026-10-24 (research only) <<<
+github.com/oosexgang/hackios-xnu-kernel (APSL 2.0) + hackios-xnu-userland (MIT): XNU 8796 + iOS 16.5 on POCO X5 Pro (Adreno 642L) and QEMU virt (Linux host). Observed in the repos (clone in the session scratchpad, not kept): their QEMU target has NO GPU (`-device ramfb`, CPU renderer; build.sh: GL=1 is not even loaded outside the phone with gpu=1). The phone GPU path = Mesa 25.0.7 freedreno + `userland/src/eagl.c` (169 KB, EAGL -> Mesa bridge so CoreAnimation uses its GLES renderer; same design as ios-sailfish, but MIT-licensed, so reusable with attribution) + an msm-DRM shim over their own IOKit GPU service. Their Metal (`redwoodmetal.m`, docs/air.md: AIR -> NIR -> ir3) is early: 30 of 456 system shaders run to completion on the Adreno, not used by apps. Possibly useful to us: eagl.c (GLES path for CA, needs a host-backed GL: virgl is blocked on macOS, see 2026-10-22 GL entry), their measured Metal plugin notes (docs/metal.md in userland) for our remoting bugs.
+
 ### >>> Video playback (user request 2026-10-23 ~16:35: "video playback without gpu") <<<
 
 **YouTube PARKED by the user (2026-10-23 ~17:45): "no need to make youtube work for now".** User sees YouTube's own "Video unavailable" often (with 0107). Not investigated; if resumed: reproduce, then read YouTube's + mediaserverd's os_log from an APFS clone of the disk (tools/ios-oslog.py) to tell a server-side refusal (sideloaded/modified app, device checks) from a local player failure.
