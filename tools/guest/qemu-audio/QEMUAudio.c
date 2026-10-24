@@ -6,28 +6,31 @@
  * devices (VirtualAudioDevice_Default, ...) out of the physical HAL devices
  * it recognises. It classifies a physical device by its UID alone
  * (DeviceManager -> factory comparing the UID with "Codec", "Speaker",
- * "USB Audio Output", ...), so this driver publishes one output device whose
- * UID is "Codec", the built-in codec of the iPhone X profile. VirtualAudio
- * only accepts a codec that also has input streams (SubPortPolicy.cpp: "The
- * HAL returned input stream size of %u"), so there is a microphone stream
- * too; it records silence. It also needs output volume and mute: the HAL
- * answers a device's 'vold'/'mute' from its control objects. VirtualAudio
- * makes its ports (built-in mic, speaker, ...) from the codec's data sources
- * ('ssc#' per scope, from data source controls), one per source ID: input
- * sources become microphone ports. Output ports are announced differently:
- * Device_Codec_Aspen checks for a 'mute' control on output element 4
- * (speaker) and 3 (receiver), and each port has its own volume.
+ * "USB Audio Output", ...), so this driver publishes devices with the UIDs of
+ * the iPhone X topology: "Codec" (receiver, microphone) and "Speaker" (the
+ * speaker amplifier, a device of its own).
  *
- * Step 1: the device runs on its own clock (host time at 48 kHz) and only
- * measures what it is given (peak level once a second in the log). Step 2
+ * What VirtualAudio requires of them, found one boot at a time:
+ *   - Codec: input streams (SubPortPolicy.cpp: "The HAL returned input
+ *     stream size of %u"); input data sources ('ssc#', from a data source
+ *     control) become microphone ports ('imic' -> "Built-In Microphone");
+ *     output ports come from 'mute' controls on output elements (element 3:
+ *     receiver, element 4: speaker); every port has its own volume; device
+ *     volume and mute ('vold', 'mute') come from controls on element 0.
+ *   - Speaker: output and telemetry data sources, a hardware volume range
+ *     (Device_Speaker_Aspen.cpp).
+ *
+ * Step 1: the devices run on their own clock (host time at 48 kHz) and only
+ * measure what they are given (peak level once a second in the log). Step 2
  * hands the samples to the kernel's virtio-sound driver.
  *
  * Every property we do not answer is logged once, so the log shows what
- * VirtualAudio asks of a codec. Log: /private/var/tmp/QEMUAudio.log and
- * os_log ("QEMUAudio:").
+ * VirtualAudio asks. Log: /private/var/tmp/QEMUAudio.log and os_log
+ * ("QEMUAudio:").
  */
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <dispatch/dispatch.h>
 #include <fcntl.h>
 #include <mach/mach_time.h>
 #include <math.h>
@@ -38,61 +41,139 @@
 #include <string.h>
 #include <unistd.h>
 
-enum {
-	kObjPlugIn = kAudioObjectPlugInObject, kObjDevice = 2, kObjOutStream = 3, kObjInStream = 4,
-	kObjVolume = 5, kObjMute = 6,	/* output volume and mute controls */
-	kObjInSource = 7, kObjOutSource = 8,	/* data sources: VirtualAudio's ports */
-	kObjSpeakerMute = 9, kObjReceiverMute = 10,	/* output port mutes */
-	kObjSpeakerVolume = 11, kObjReceiverVolume = 12,	/* output port volumes */
-};
-
 #define RATE		48000.0
 #define CHANNELS	2
 #define PERIOD		16384		/* frames between zero time stamps */
-/*
- * QEMUAUDIO_AS_USB: present the device as a USB audio interface instead of
- * the built-in codec. VirtualAudio's routing database rejects routes to the
- * codec's ports ('nort'), while a newly connected USB device is a route iOS
- * switches to by itself (experiment, 2026-10-25: fails, the HAL answers the
- * USB location ID 'lcID' itself, from IOKit, and VirtualAudio gives up).
- */
-#define QEMUAUDIO_AS_USB 0
-#if QEMUAUDIO_AS_USB
-#define DEVICE_UID	"cx.lev.ios-qemu.QEMUAudio"
-#define TRANSPORT	kAudioDeviceTransportTypeUSB
-#else
-#define DEVICE_UID	"Codec"
-#define TRANSPORT	kAudioDeviceTransportTypeBuiltIn
-#endif
 #define MODEL_UID	"cx.lev.ios-qemu.QEMUAudio.model"
 #define MIN_DB		-64.0f
+/*
+ * QEMUAUDIO_SPEAKER_DEVICE: the speaker port comes from a "Speaker" device
+ * instead of output element 4 of the codec (2026-10-25: with the speaker on
+ * the codec, every route change fails with 'nort' in VirtualAudio's routing
+ * database; guess: the iPhone X database expects the separate amplifier).
+ */
+#define QEMUAUDIO_SPEAKER_DEVICE 1
+/*
+ * QEMUAUDIO_FAKE_VAD (audio-plugin.py setup --fake-vad): VirtualAudio.plugin
+ * stays disabled and this driver publishes the device MediaExperience looks
+ * up by UID, VirtualAudioDevice_Default, as a plain output device
+ * (experiment: VirtualAudio's routing database finds no route to the codec
+ * or speaker ports, 'nort').
+ */
+/*
+ * QEMUAUDIO_HEADPHONES: the codec has a headphone jack (a jack control, which
+ * the HAL turns into the device's 'jack' on the output scope: Device_Codec_Aspen
+ * then makes a wired headphones port on output element 1)
+ * that is plugged in a few seconds after start. VirtualAudio never re-routes
+ * for new built-in ports ('ncru'), but a jack insertion is the ordinary way
+ * an iPhone's route changes, so playback should follow it to our device.
+ */
+#define QEMUAUDIO_HEADPHONES 1
+#ifndef QEMUAUDIO_FAKE_VAD
+#define QEMUAUDIO_FAKE_VAD 0
+#endif
+
+/* ---- object model: one row per object, looked up by ID ---- */
+
+enum kind { PLUGIN, DEVICE, STREAM, VOLUME, MUTE, SOURCE, JACK };
+
+enum {
+	kObjPlugIn = kAudioObjectPlugInObject,
+	kObjCodec = 2, kObjCodecOut, kObjCodecIn, kObjCodecVolume, kObjCodecMute, kObjCodecInSource,
+	kObjReceiverMute, kObjReceiverVolume, kObjCodecSpeakerMute, kObjCodecSpeakerVolume,
+	kObjHeadphoneMute, kObjHeadphoneVolume, kObjCodecJack,
+	kObjSpeaker = 20, kObjSpeakerOut, kObjSpeakerTelemetry, kObjSpeakerVolume, kObjSpeakerMute,
+	kObjSpeakerOutSource, kObjSpeakerTelemetrySource,
+};
+
+struct object {
+	AudioObjectID id;
+	enum kind kind;
+	AudioObjectID owner;
+	Boolean input;			/* stream/control scope: input, else output */
+	AudioObjectPropertyElement element;	/* controls */
+	const char *name;		/* devices: the UID too */
+	UInt32 terminal;		/* streams */
+	UInt32 sources[4];		/* data sources (4cc) */
+	UInt32 current[4], ncurrent;	/* state: the selected ones (all of them at first) */
+	Float32 volume_db;		/* state: MIN_DB..0 */
+	UInt32 muted;
+};
+
+static struct object objects[] = {
+	{ kObjPlugIn, PLUGIN, kAudioObjectUnknown },
+#if QEMUAUDIO_FAKE_VAD
+	{ kObjCodec, DEVICE, kObjPlugIn, .name = "VirtualAudioDevice_Default" },
+	{ kObjCodecOut, STREAM, kObjCodec, false, .name = "Output", .terminal = kAudioStreamTerminalTypeSpeaker },
+	{ kObjCodecIn, STREAM, kObjCodec, true, .name = "Input", .terminal = kAudioStreamTerminalTypeMicrophone },
+	{ kObjCodecVolume, VOLUME, kObjCodec, false, kAudioObjectPropertyElementMain },
+	{ kObjCodecMute, MUTE, kObjCodec, false, kAudioObjectPropertyElementMain },
+#else
+	{ kObjCodec, DEVICE, kObjPlugIn, .name = "Codec" },
+	{ kObjCodecOut, STREAM, kObjCodec, false, .name = "Codec Output", .terminal = kAudioStreamTerminalTypeReceiverSpeaker },
+	{ kObjCodecIn, STREAM, kObjCodec, true, .name = "Codec Input", .terminal = kAudioStreamTerminalTypeMicrophone },
+	{ kObjCodecVolume, VOLUME, kObjCodec, false, kAudioObjectPropertyElementMain },
+	{ kObjCodecMute, MUTE, kObjCodec, false, kAudioObjectPropertyElementMain },
+	{ kObjCodecInSource, SOURCE, kObjCodec, true, .sources = { 'imic' } },	/* built-in microphone */
+	{ kObjReceiverMute, MUTE, kObjCodec, false, 3 },
+	{ kObjReceiverVolume, VOLUME, kObjCodec, false, 3 },
+#if QEMUAUDIO_HEADPHONES
+	{ kObjHeadphoneMute, MUTE, kObjCodec, false, 1 },
+	{ kObjHeadphoneVolume, VOLUME, kObjCodec, false, 1 },
+	{ kObjCodecJack, JACK, kObjCodec, false, kAudioObjectPropertyElementMain },	/* the HAL's 'jack' */
+#endif
+#if !QEMUAUDIO_SPEAKER_DEVICE
+	{ kObjCodecSpeakerMute, MUTE, kObjCodec, false, 4 },
+	{ kObjCodecSpeakerVolume, VOLUME, kObjCodec, false, 4 },
+#else
+	{ kObjSpeaker, DEVICE, kObjPlugIn, .name = "Speaker" },
+	{ kObjSpeakerOut, STREAM, kObjSpeaker, false, .name = "Speaker Output", .terminal = kAudioStreamTerminalTypeSpeaker },
+	{ kObjSpeakerTelemetry, STREAM, kObjSpeaker, true, .name = "Speaker Telemetry", .terminal = kAudioStreamTerminalTypeLine },
+	{ kObjSpeakerVolume, VOLUME, kObjSpeaker, false, kAudioObjectPropertyElementMain },
+	{ kObjSpeakerMute, MUTE, kObjSpeaker, false, kAudioObjectPropertyElementMain },
+	{ kObjSpeakerOutSource, SOURCE, kObjSpeaker, false, .sources = { 'spkr' } },
+	/* voltage and current of the two speakers (VirtualAudio selects all four) */
+	{ kObjSpeakerTelemetrySource, SOURCE, kObjSpeaker, true, .sources = { 'spV0', 'spI0', 'spV1', 'spI1' } },
+#endif
+#endif
+};
+#define NOBJECTS (sizeof(objects) / sizeof(objects[0]))
+
+static struct object *find(AudioObjectID id)
+{
+	for (unsigned i = 0; i < NOBJECTS; i++)
+		if (objects[i].id == id)
+			return &objects[i];
+	return NULL;
+}
+
+static unsigned nsources(const struct object *o)
+{
+	unsigned n = 0;
+	while (n < 4 && o->sources[n])
+		n++;
+	return n;
+}
 
 static AudioServerPlugInHostRef host;
+static UInt32 jack_connected;		/* QEMUAUDIO_HEADPHONES */
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static UInt32 io_clients;
 static Float64 ticks_per_frame;
-static UInt64 anchor_time, period_count;
-static UInt32 seed = 1;
-static Float32 peak;
-static UInt64 frames_seen, last_report;
-/* volume and mute per output element: main, receiver, speaker */
-static const AudioObjectPropertyElement port_element[3] = { kAudioObjectPropertyElementMain, 3, 4 };
-static Float32 volume_db[3];		/* MIN_DB..0 */
-static UInt32 muted[3];
 
-static int volume_port(AudioObjectID o)
+/* IO state per device */
+struct io {
+	UInt32 clients;
+	UInt64 anchor_time, period_count;
+	UInt32 seed;
+	Float32 peak;
+	UInt64 frames, last_report;
+};
+static struct io io_codec = { .seed = 1 }, io_speaker = { .seed = 1 };
+
+static struct io *io_for(AudioObjectID dev)
 {
-	return o == kObjVolume ? 0 : o == kObjReceiverVolume ? 1 : o == kObjSpeakerVolume ? 2 : -1;
+	return dev == kObjSpeaker ? &io_speaker : &io_codec;
 }
-
-static int mute_port(AudioObjectID o)
-{
-	return o == kObjMute ? 0 : o == kObjReceiverMute ? 1 : o == kObjSpeakerMute ? 2 : -1;
-}
-
-/* data source IDs (4cc, port subtypes as VirtualAudio names them) */
-#define SRC_IN		'imic'		/* built-in microphone */
-#define SRC_OUT		'spkr'		/* speaker */
 
 static void qlog(const char *fmt, ...)
 {
@@ -206,7 +287,7 @@ static OSStatus va_set(AudioObjectID o, const AudioObjectPropertyAddress *a, UIn
 static Boolean va_has(AudioObjectID o, const AudioObjectPropertyAddress *a)
 {
 	Boolean r = real_has(o, a);
-	if (!r && o >= 50 && o < 70)	/* only physical devices and their objects */
+	if (!r && o >= 50 && o < 100)	/* only physical devices and their objects */
 		va_fail("HasProperty", o, a, 0);
 	return r;
 }
@@ -268,6 +349,69 @@ static void trace_va(void)
 }
 #endif
 
+/*
+ * QEMUAUDIO_REROUTE: VirtualAudio computes the default device's first route
+ * before it adds any other plugin's devices, so it routes playback to its
+ * Null_Device, and new built-in ports never re-route ('ncru'). MediaExperience
+ * re-routes only when an audio category changes (cmsmSetVADRouteConfiguration
+ * -> vaemSetRouteConfigurationDictionaryOnVAD: property 'rtcf' on the VAD,
+ * data { in: CFDictionary, out: CFDictionary } like AudioValueTranslation).
+ * So once our devices are in, send the request MediaExperience would send for
+ * playback: category 'csav', mode 'imdf'.
+ */
+#define QEMUAUDIO_REROUTE 0	/* 2026-10-25: accepted, but served from VirtualAudio's route cache */
+#if QEMUAUDIO_REROUTE
+#include <dispatch/dispatch.h>
+#include <dlfcn.h>
+
+static void reroute(void)
+{
+	OSStatus (*get)(AudioObjectID, const AudioObjectPropertyAddress *, UInt32, const void *, UInt32 *, void *) =
+	    dlsym(RTLD_DEFAULT, "AudioObjectGetPropertyData");
+	OSStatus (*set)(AudioObjectID, const AudioObjectPropertyAddress *, UInt32, const void *, UInt32, const void *) =
+	    dlsym(RTLD_DEFAULT, "AudioObjectSetPropertyData");
+	if (!get || !set)
+		return;
+	/* 'rtcf' is a property of VirtualAudio's plug-in object: find it by bundle ID */
+	AudioObjectPropertyAddress list = { 'plg#', kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+	AudioObjectID ids[32], va = kAudioObjectUnknown;
+	UInt32 size = sizeof(ids);
+	OSStatus err = get(1 /* kAudioObjectSystemObject */, &list, 0, NULL, &size, ids);
+	for (UInt32 i = 0; !err && i < size / sizeof(AudioObjectID); i++) {
+		AudioObjectPropertyAddress ba = { kAudioPlugInPropertyBundleID, kAudioObjectPropertyScopeGlobal,
+						  kAudioObjectPropertyElementMain };
+		CFStringRef bundle = NULL;
+		UInt32 bs = sizeof(bundle);
+		if (get(ids[i], &ba, 0, NULL, &bs, &bundle) == noErr && bundle) {
+			if (CFEqual(bundle, CFSTR("com.apple.audio.CoreAudio.VirtualAudio")))
+				va = ids[i];
+			CFRelease(bundle);
+		}
+	}
+	if (err || va == kAudioObjectUnknown) {
+		qlog("reroute: VirtualAudio plug-in not found among %u plug-ins (%d)", (unsigned)(size / sizeof(AudioObjectID)),
+		     (int)err);
+		return;
+	}
+	SInt32 category = 'csav', mode = 'imdf';
+	CFNumberRef c = CFNumberCreate(NULL, kCFNumberSInt32Type, &category), m = CFNumberCreate(NULL, kCFNumberSInt32Type, &mode);
+	const void *keys[] = { CFSTR("category"), CFSTR("mode") }, *vals[] = { c, m };
+	CFDictionaryRef config = CFDictionaryCreate(NULL, keys, vals, 2, &kCFTypeDictionaryKeyCallBacks,
+						    &kCFTypeDictionaryValueCallBacks);
+	CFDictionaryRef result = NULL;
+	struct { const void *in; UInt32 in_size; void *out; UInt32 out_size; } data = {
+		config, sizeof(config), &result, sizeof(result) };
+	AudioObjectPropertyAddress rtcf = { 'rtcf', kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+	err = set(va, &rtcf, 0, NULL, sizeof(data), &data);
+	qlog("reroute: 'rtcf' csav/imdf on VirtualAudio %u -> %d, result %s", va, (int)err, result ? "yes" : "none");
+	if (result)
+		CFRelease(result);
+	CFRelease(config);
+	CFRelease(c);
+	CFRelease(m);
+}
+#endif
+
 /* ---- IUnknown ---- */
 
 static AudioServerPlugInDriverInterface iface;
@@ -297,12 +441,34 @@ static ULONG Release(void *self) { return refcount > 1 ? --refcount : refcount; 
 static OSStatus Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRef h)
 {
 	host = h;
+	for (unsigned i = 0; i < NOBJECTS; i++)
+		if (objects[i].kind == SOURCE) {
+			objects[i].ncurrent = nsources(&objects[i]);
+			memcpy(objects[i].current, objects[i].sources, sizeof(objects[i].current));
+		}
 	mach_timebase_info_data_t tb;
 	mach_timebase_info(&tb);
 	ticks_per_frame = 1e9 / RATE * tb.denom / tb.numer;
-	qlog("initialized: device '%s', %d ch, %.0f Hz", DEVICE_UID, CHANNELS, RATE);
+	qlog("initialized: %d ch, %.0f Hz, speaker device %d, fake VAD %d", CHANNELS, RATE, QEMUAUDIO_SPEAKER_DEVICE,
+	     QEMUAUDIO_FAKE_VAD);
 #if QEMUAUDIO_TRACE_VA
 	trace_va();
+#endif
+#if QEMUAUDIO_HEADPHONES && !QEMUAUDIO_FAKE_VAD
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+		jack_connected = 1;
+		AudioObjectPropertyAddress ch = { 'jack', kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain };
+		AudioObjectPropertyAddress val = { kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal,
+						   kAudioObjectPropertyElementMain };
+		host->PropertiesChanged(host, kObjCodecJack, 1, &val);
+		host->PropertiesChanged(host, kObjCodec, 1, &ch);
+		qlog("headphones plugged in");
+	});
+#endif
+#if QEMUAUDIO_REROUTE && !QEMUAUDIO_FAKE_VAD
+	for (int t = 5; t <= 15; t += 10)
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, t * NSEC_PER_SEC),
+			       dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ reroute(); });
 #endif
 	return noErr;
 }
@@ -344,137 +510,124 @@ static OSStatus AbortDeviceConfigurationChange(AudioServerPlugInDriverRef d, Aud
 
 /* ---- properties ---- */
 
-static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid,
-			   const AudioObjectPropertyAddress *a);
-
-static OSStatus IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid,
-				   const AudioObjectPropertyAddress *a, Boolean *out)
-{
-	if (!HasProperty(d, obj, pid, a))
-		return kAudioHardwareUnknownPropertyError;
-	switch (obj) {
-	case kObjOutStream:
-	case kObjInStream:
-		*out = a->mSelector == kAudioStreamPropertyVirtualFormat ||
-		       a->mSelector == kAudioStreamPropertyPhysicalFormat;
-		break;
-	case kObjVolume:
-	case kObjSpeakerVolume:
-	case kObjReceiverVolume:
-		*out = a->mSelector == kAudioLevelControlPropertyScalarValue ||
-		       a->mSelector == kAudioLevelControlPropertyDecibelValue;
-		break;
-	case kObjMute:
-	case kObjSpeakerMute:
-	case kObjReceiverMute:
-		*out = a->mSelector == kAudioBooleanControlPropertyValue;
-		break;
-	case kObjInSource:
-	case kObjOutSource:
-		*out = a->mSelector == kAudioSelectorControlPropertyCurrentItem;
-		break;
-	default:
-		*out = false;
-	}
-	return noErr;
-}
-
 /*
- * One table drives HasProperty, GetPropertyDataSize and GetPropertyData:
+ * One function drives HasProperty, GetPropertyDataSize and GetPropertyData:
  * get() writes the value into out (if size bytes fit) and returns the
  * value's size, 0 for "no such property" or EMPTY for an empty list.
  */
 #define EMPTY 0x80000000u
-static UInt32 get(AudioObjectID obj, const AudioObjectPropertyAddress *a, UInt32 size, void *out)
+
+/* the objects owned by o (streams and controls of a device), filtered by scope */
+static UInt32 owned(const struct object *o, const AudioObjectPropertyAddress *a, AudioObjectID *ids)
 {
+	UInt32 n = 0;
+	for (unsigned i = 0; i < NOBJECTS; i++) {
+		const struct object *c = &objects[i];
+		if (c->owner != o->id)
+			continue;
+		if (a->mSelector == kAudioPlugInPropertyDeviceList && c->kind != DEVICE)
+			continue;
+		if (a->mSelector == kAudioDevicePropertyStreams && c->kind != STREAM)
+			continue;
+		if (a->mSelector == kAudioObjectPropertyControlList && (c->kind == STREAM || c->kind == DEVICE))
+			continue;
+		if (o->kind == DEVICE && ((a->mScope == kAudioObjectPropertyScopeInput && !c->input) ||
+					  (a->mScope == kAudioObjectPropertyScopeOutput && c->input)))
+			continue;
+		ids[n++] = c->id;
+	}
+	return n;
+}
+
+static UInt32 get(AudioObjectID id, const AudioObjectPropertyAddress *a, UInt32 size, void *out)
+{
+	const struct object *o = find(id);
 	char buf[256];
 	UInt32 n = 0;
 #define VAL(T, v) do { T _v = (v); n = sizeof(T); memcpy(buf, &_v, n); } while (0)
-#define STR(s) VAL(CFStringRef, CFSTR(s))
-	switch (obj) {
-	case kObjPlugIn:
+#define STR(s) VAL(CFStringRef, CFStringCreateWithCString(NULL, (s), kCFStringEncodingUTF8))
+	if (!o)
+		return 0;
+	/* common to every object */
+	switch (a->mSelector) {
+	case kAudioObjectPropertyOwner: VAL(AudioObjectID, o->owner); break;
+	case kAudioObjectPropertyOwnedObjects:
+	case kAudioPlugInPropertyDeviceList:
+	case kAudioDevicePropertyStreams:
+	case kAudioObjectPropertyControlList: {
+		if (a->mSelector == kAudioPlugInPropertyDeviceList && o->kind != PLUGIN)
+			break;
+		if ((a->mSelector == kAudioDevicePropertyStreams || a->mSelector == kAudioObjectPropertyControlList) &&
+		    o->kind != DEVICE)
+			break;
+		AudioObjectID ids[NOBJECTS];
+		UInt32 count = owned(o, a, ids);
+		n = count ? count * sizeof(AudioObjectID) : EMPTY;
+		memcpy(buf, ids, count * sizeof(AudioObjectID));
+		break;
+	}
+	}
+	if (n)
+		goto done;
+	switch (o->kind) {
+	case PLUGIN:
 		switch (a->mSelector) {
 		case kAudioObjectPropertyBaseClass: VAL(AudioClassID, kAudioObjectClassID); break;
 		case kAudioObjectPropertyClass: VAL(AudioClassID, kAudioPlugInClassID); break;
-		case kAudioObjectPropertyOwner: VAL(AudioObjectID, kAudioObjectUnknown); break;
 		case kAudioObjectPropertyManufacturer: STR("ios-qemu"); break;
-		case kAudioObjectPropertyOwnedObjects:
-		case kAudioPlugInPropertyDeviceList: VAL(AudioObjectID, kObjDevice); break;
 		case kAudioPlugInPropertyResourceBundle: STR(""); break;
-		case kAudioPlugInPropertyTranslateUIDToDevice: {
-			/* the qualifier (a CFString UID) arrives in out's slot; checked by the caller */
-			VAL(AudioObjectID, kObjDevice);
-			break;
-		}
+		/* the qualifier (a CFString UID) is checked by the caller */
+		case kAudioPlugInPropertyTranslateUIDToDevice: VAL(AudioObjectID, kAudioObjectUnknown); break;
 		}
 		break;
-	case kObjDevice:
+	case DEVICE:
 		switch (a->mSelector) {
 		case kAudioObjectPropertyBaseClass: VAL(AudioClassID, kAudioObjectClassID); break;
 		case kAudioObjectPropertyClass: VAL(AudioClassID, kAudioDeviceClassID); break;
-		case kAudioObjectPropertyOwner: VAL(AudioObjectID, kObjPlugIn); break;
-		case kAudioObjectPropertyName: STR("QEMU Audio"); break;
+		case kAudioObjectPropertyName: STR(o->name); break;
 		case kAudioObjectPropertyManufacturer: STR("ios-qemu"); break;
-		case kAudioDevicePropertyDeviceUID: STR(DEVICE_UID); break;
+		case kAudioDevicePropertyDeviceUID: STR(o->name); break;
 		case kAudioDevicePropertyModelUID: STR(MODEL_UID); break;
-		case kAudioDevicePropertyTransportType: VAL(UInt32, TRANSPORT); break;
-#if QEMUAUDIO_AS_USB
-		case 'lcID': VAL(UInt32, 0x01100000); break;	/* USB location ID: bus 1, port 1 */
-		case kAudioObjectPropertyCustomPropertyInfoList:	/* the HAL forwards only declared custom properties */
-			VAL(AudioServerPlugInCustomPropertyInfo,
-			    ((AudioServerPlugInCustomPropertyInfo){ 'lcID', kAudioServerPlugInCustomPropertyDataTypeNone,
-								    kAudioServerPlugInCustomPropertyDataTypeNone }));
-			break;
-#endif
-		case kAudioDevicePropertyRelatedDevices: VAL(AudioObjectID, kObjDevice); break;
-		case kAudioDevicePropertyClockDomain: VAL(UInt32, 0); break;
+		case kAudioDevicePropertyTransportType: VAL(UInt32, kAudioDeviceTransportTypeBuiltIn); break;
+		case kAudioDevicePropertyRelatedDevices: VAL(AudioObjectID, o->id); break;
+		case kAudioDevicePropertyClockDomain: VAL(UInt32, 1); break;	/* one clock for both devices */
 		case kAudioDevicePropertyDeviceIsAlive: VAL(UInt32, 1); break;
-		case kAudioDevicePropertyDeviceIsRunning: VAL(UInt32, io_clients > 0); break;
+		case kAudioDevicePropertyDeviceIsRunning: VAL(UInt32, io_for(o->id)->clients > 0); break;
 		case kAudioDevicePropertyDeviceCanBeDefaultDevice:
 		case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: VAL(UInt32, 1); break;
 		case kAudioDevicePropertyLatency:
 		case kAudioDevicePropertySafetyOffset: VAL(UInt32, 0); break;
-		case kAudioDevicePropertyStreams:
-			if (a->mScope == kAudioObjectPropertyScopeInput)
-				VAL(AudioObjectID, kObjInStream);
-			else if (a->mScope == kAudioObjectPropertyScopeOutput)
-				VAL(AudioObjectID, kObjOutStream);
-			else {
-				AudioObjectID ids[2] = { kObjOutStream, kObjInStream };
-				n = sizeof(ids);
-				memcpy(buf, ids, n);
-			}
-			break;
-		case kAudioObjectPropertyOwnedObjects:
-		case kAudioObjectPropertyControlList: {
-			/* every object the device owns, by scope; ControlList leaves out the streams */
-			static const struct { AudioObjectID id; Boolean input, control; } owned[] = {
-				{ kObjOutStream, false, false }, { kObjInStream, true, false },
-				{ kObjVolume, false, true }, { kObjMute, false, true },
-				{ kObjSpeakerMute, false, true }, { kObjReceiverMute, false, true },
-				{ kObjSpeakerVolume, false, true }, { kObjReceiverVolume, false, true },
-				{ kObjInSource, true, true }, { kObjOutSource, false, true },
-			};
-			AudioObjectID ids[10];
-			UInt32 count = 0;
-			for (unsigned i = 0; i < sizeof(owned) / sizeof(owned[0]); i++) {
-				if (a->mSelector == kAudioObjectPropertyControlList && !owned[i].control)
-					continue;
-				if ((a->mScope == kAudioObjectPropertyScopeInput && !owned[i].input) ||
-				    (a->mScope == kAudioObjectPropertyScopeOutput && owned[i].input))
-					continue;
-				ids[count++] = owned[i].id;
-			}
-			n = count ? count * sizeof(AudioObjectID) : EMPTY;
-			memcpy(buf, ids, count * sizeof(AudioObjectID));
-			break;
-		}
 		case kAudioDevicePropertyNominalSampleRate: VAL(Float64, RATE); break;
 		case kAudioDevicePropertyAvailableNominalSampleRates:
 			VAL(AudioValueRange, ((AudioValueRange){ RATE, RATE }));
 			break;
 		case kAudioDevicePropertyIsHidden: VAL(UInt32, 0); break;
 		case kAudioDevicePropertyZeroTimeStampPeriod: VAL(UInt32, PERIOD); break;
+#if QEMUAUDIO_HEADPHONES
+		/*
+		 * 'head': what is plugged into the jack, a dictionary
+		 * (HALJackStateHandler: without it "Unknown JackDescriptor").
+		 * "earpiece design" 1..8 are Apple's wired earphone models;
+		 * 1 makes the descriptor 'jb15'. A custom property, so the HAL
+		 * only forwards it when it is in the custom property list.
+		 */
+		case kAudioObjectPropertyCustomPropertyInfoList:
+			if (o->id == kObjCodec)
+				VAL(AudioServerPlugInCustomPropertyInfo,
+				    ((AudioServerPlugInCustomPropertyInfo){ 'head', kAudioServerPlugInCustomPropertyDataTypeCFPropertyList,
+									    kAudioServerPlugInCustomPropertyDataTypeNone }));
+			break;
+		case 'head':
+			if (o->id == kObjCodec) {
+				SInt32 design = 1;
+				CFNumberRef d = CFNumberCreate(NULL, kCFNumberSInt32Type, &design);
+				const void *k = CFSTR("earpiece design"), *v = d;
+				VAL(CFDictionaryRef, CFDictionaryCreate(NULL, &k, &v, 1, &kCFTypeDictionaryKeyCallBacks,
+								       &kCFTypeDictionaryValueCallBacks));
+				CFRelease(d);
+			}
+			break;
+#endif
 		case kAudioDevicePropertyPreferredChannelsForStereo: {
 			UInt32 ch[2] = { 1, 2 };
 			n = sizeof(ch);
@@ -489,25 +642,14 @@ static UInt32 get(AudioObjectID obj, const AudioObjectPropertyAddress *a, UInt32
 		}
 		}
 		break;
-	case kObjOutStream:
-	case kObjInStream: {
-		Boolean in = obj == kObjInStream;
+	case STREAM:
 		switch (a->mSelector) {
 		case kAudioObjectPropertyBaseClass: VAL(AudioClassID, kAudioObjectClassID); break;
 		case kAudioObjectPropertyClass: VAL(AudioClassID, kAudioStreamClassID); break;
-		case kAudioObjectPropertyOwner: VAL(AudioObjectID, kObjDevice); break;
-		case kAudioObjectPropertyName:
-			if (in)
-				STR("QEMU Audio Input");
-			else
-				STR("QEMU Audio Output");
-			break;
-		case kAudioObjectPropertyOwnedObjects: n = EMPTY; break;
+		case kAudioObjectPropertyName: STR(o->name); break;
 		case kAudioStreamPropertyIsActive: VAL(UInt32, 1); break;
-		case kAudioStreamPropertyDirection: VAL(UInt32, in); break;	/* 1 = input */
-		case kAudioStreamPropertyTerminalType:
-			VAL(UInt32, in ? kAudioStreamTerminalTypeMicrophone : kAudioStreamTerminalTypeSpeaker);
-			break;
+		case kAudioStreamPropertyDirection: VAL(UInt32, o->input); break;	/* 1 = input */
+		case kAudioStreamPropertyTerminalType: VAL(UInt32, o->terminal); break;
 		case kAudioStreamPropertyStartingChannel: VAL(UInt32, 1); break;
 		case kAudioStreamPropertyLatency: VAL(UInt32, 0); break;
 		case kAudioStreamPropertyVirtualFormat:
@@ -519,33 +661,30 @@ static UInt32 get(AudioObjectID obj, const AudioObjectPropertyAddress *a, UInt32
 			break;
 		}
 		break;
-	}
-	case kObjVolume:
-	case kObjMute:
-	case kObjSpeakerMute:
-	case kObjReceiverMute:
-	case kObjSpeakerVolume:
-	case kObjReceiverVolume: {
-		int vp = volume_port(obj), mp = mute_port(obj);
-		Boolean vol = vp >= 0;
+	case VOLUME:
+	case MUTE:
+	case SOURCE:
+	case JACK:
 		switch (a->mSelector) {
 		case kAudioObjectPropertyBaseClass:
-			VAL(AudioClassID, vol ? kAudioLevelControlClassID : kAudioBooleanControlClassID);
+			VAL(AudioClassID, o->kind == VOLUME ? kAudioLevelControlClassID :
+			    o->kind == SOURCE ? kAudioSelectorControlClassID : kAudioBooleanControlClassID);
 			break;
-		case kAudioObjectPropertyClass: VAL(AudioClassID, vol ? kAudioVolumeControlClassID : kAudioMuteControlClassID); break;
-		case kAudioObjectPropertyOwner: VAL(AudioObjectID, kObjDevice); break;
-		case kAudioObjectPropertyOwnedObjects: n = EMPTY; break;
-		case kAudioControlPropertyScope: VAL(AudioObjectPropertyScope, kAudioObjectPropertyScopeOutput); break;
-		case kAudioControlPropertyElement:
-			VAL(AudioObjectPropertyElement, port_element[vol ? vp : mp]);
+		case kAudioObjectPropertyClass:
+			VAL(AudioClassID, o->kind == VOLUME ? kAudioVolumeControlClassID : o->kind == MUTE ? kAudioMuteControlClassID :
+			    o->kind == JACK ? kAudioJackControlClassID : kAudioDataSourceControlClassID);
 			break;
+		case kAudioControlPropertyScope:
+			VAL(AudioObjectPropertyScope, o->input ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput);
+			break;
+		case kAudioControlPropertyElement: VAL(AudioObjectPropertyElement, o->element); break;
 		}
 		if (n)
 			break;
-		if (vol)
+		if (o->kind == VOLUME)
 			switch (a->mSelector) {
-			case kAudioLevelControlPropertyScalarValue: VAL(Float32, 1.0f - volume_db[vp] / MIN_DB); break;
-			case kAudioLevelControlPropertyDecibelValue: VAL(Float32, volume_db[vp]); break;
+			case kAudioLevelControlPropertyScalarValue: VAL(Float32, 1.0f - o->volume_db / MIN_DB); break;
+			case kAudioLevelControlPropertyDecibelValue: VAL(Float32, o->volume_db); break;
 			case kAudioLevelControlPropertyDecibelRange:
 				VAL(AudioValueRange, ((AudioValueRange){ MIN_DB, 0 }));
 				break;
@@ -553,34 +692,36 @@ static UInt32 get(AudioObjectID obj, const AudioObjectPropertyAddress *a, UInt32
 			case kAudioLevelControlPropertyConvertScalarToDecibels:
 			case kAudioLevelControlPropertyConvertDecibelsToScalar: VAL(Float32, 0); break;
 			}
-		else if (a->mSelector == kAudioBooleanControlPropertyValue)
-			VAL(UInt32, muted[mp]);
+		else if (o->kind == MUTE && a->mSelector == kAudioBooleanControlPropertyValue)
+			VAL(UInt32, o->muted);
+		else if (o->kind == JACK && a->mSelector == kAudioBooleanControlPropertyValue)
+			VAL(UInt32, jack_connected);
+		else if (o->kind == SOURCE)
+			switch (a->mSelector) {
+			case kAudioSelectorControlPropertyCurrentItem:
+				n = o->ncurrent ? o->ncurrent * sizeof(UInt32) : EMPTY;
+				memcpy(buf, o->current, o->ncurrent * sizeof(UInt32));
+				break;
+			case kAudioSelectorControlPropertyAvailableItems:
+				n = nsources(o) * sizeof(UInt32);
+				memcpy(buf, o->sources, n);
+				break;
+			/* the item ID arrives as the qualifier; answered by the caller */
+			case kAudioSelectorControlPropertyItemName: VAL(CFStringRef, NULL); break;
+			}
 		break;
 	}
-	case kObjInSource:
-	case kObjOutSource: {
-		Boolean in = obj == kObjInSource;
-		switch (a->mSelector) {
-		case kAudioObjectPropertyBaseClass: VAL(AudioClassID, kAudioSelectorControlClassID); break;
-		case kAudioObjectPropertyClass: VAL(AudioClassID, kAudioDataSourceControlClassID); break;
-		case kAudioObjectPropertyOwner: VAL(AudioObjectID, kObjDevice); break;
-		case kAudioObjectPropertyOwnedObjects: n = EMPTY; break;
-		case kAudioControlPropertyScope:
-			VAL(AudioObjectPropertyScope, in ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput);
-			break;
-		case kAudioControlPropertyElement: VAL(AudioObjectPropertyElement, kAudioObjectPropertyElementMain); break;
-		case kAudioSelectorControlPropertyCurrentItem:
-		case kAudioSelectorControlPropertyAvailableItems: VAL(UInt32, in ? SRC_IN : SRC_OUT); break;
-		/* the item ID arrives as the qualifier; answered by the caller */
-		case kAudioSelectorControlPropertyItemName: STR(""); break;
-		}
-		break;
-	}
-	}
+done:
 #undef VAL
 #undef STR
 	if (n && n != EMPTY && out && size >= n)
 		memcpy(out, buf, n);
+	else if (n == sizeof(CFStringRef) && (a->mSelector == kAudioObjectPropertyName ||
+					      a->mSelector == kAudioObjectPropertyManufacturer ||
+					      a->mSelector == kAudioDevicePropertyDeviceUID ||
+					      a->mSelector == kAudioDevicePropertyModelUID ||
+					      a->mSelector == kAudioPlugInPropertyResourceBundle || a->mSelector == 'head'))
+		CFRelease(*(CFTypeRef *)buf);	/* only the size was asked for */
 	return n;
 }
 
@@ -591,6 +732,33 @@ static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_
 		return true;
 	unknown(obj, a, "HasProperty");
 	return false;
+}
+
+static OSStatus IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid,
+				   const AudioObjectPropertyAddress *a, Boolean *out)
+{
+	const struct object *o = find(obj);
+	if (!HasProperty(d, obj, pid, a))
+		return kAudioHardwareUnknownPropertyError;
+	switch (o->kind) {
+	case STREAM:
+		*out = a->mSelector == kAudioStreamPropertyVirtualFormat ||
+		       a->mSelector == kAudioStreamPropertyPhysicalFormat;
+		break;
+	case VOLUME:
+		*out = a->mSelector == kAudioLevelControlPropertyScalarValue ||
+		       a->mSelector == kAudioLevelControlPropertyDecibelValue;
+		break;
+	case MUTE:
+		*out = a->mSelector == kAudioBooleanControlPropertyValue;
+		break;
+	case SOURCE:
+		*out = a->mSelector == kAudioSelectorControlPropertyCurrentItem;
+		break;
+	default:
+		*out = false;
+	}
+	return noErr;
 }
 
 static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid,
@@ -606,32 +774,50 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID 
 	return noErr;
 }
 
+static const char *source_name(UInt32 id)
+{
+	switch (id) {
+	case 'imic': return "Microphone";
+	case 'spkr': return "Speaker";
+	case 'spV0': return "Speaker Voltage";
+	case 'spI0': return "Speaker Current";
+	}
+	return NULL;
+}
+
 static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obj, pid_t pid,
 				const AudioObjectPropertyAddress *a, UInt32 qsize, const void *q,
 				UInt32 size, UInt32 *outsize, void *out)
 {
-	if (obj == kObjPlugIn && a->mSelector == kAudioPlugInPropertyTranslateUIDToDevice) {
+	const struct object *o = find(obj);
+	if (o && o->kind == PLUGIN && a->mSelector == kAudioPlugInPropertyTranslateUIDToDevice) {
 		CFStringRef uid = qsize >= sizeof(CFStringRef) ? *(CFStringRef *)q : NULL;
-		AudioObjectID dev = uid && CFEqual(uid, CFSTR(DEVICE_UID)) ? kObjDevice : kAudioObjectUnknown;
+		AudioObjectID dev = kAudioObjectUnknown;
+		for (unsigned i = 0; uid && i < NOBJECTS; i++)
+			if (objects[i].kind == DEVICE) {
+				CFStringRef name = CFStringCreateWithCString(NULL, objects[i].name, kCFStringEncodingUTF8);
+				if (CFEqual(uid, name))
+					dev = objects[i].id;
+				CFRelease(name);
+			}
 		if (size < sizeof(dev))
 			return kAudioHardwareBadPropertySizeError;
 		memcpy(out, &dev, sizeof(dev));
 		*outsize = sizeof(dev);
 		return noErr;
 	}
-	if ((obj == kObjInSource || obj == kObjOutSource) && a->mSelector == kAudioSelectorControlPropertyItemName) {
-		UInt32 id = qsize >= sizeof(UInt32) ? *(const UInt32 *)q : 0;
-		CFStringRef name = id == SRC_IN ? CFSTR("Microphone") : id == SRC_OUT ? CFSTR("Speaker") : NULL;
+	if (o && o->kind == SOURCE && a->mSelector == kAudioSelectorControlPropertyItemName) {
+		const char *name = source_name(qsize >= sizeof(UInt32) ? *(const UInt32 *)q : 0);
 		if (!name)
 			return kAudioHardwareIllegalOperationError;
-		if (size < sizeof(name))
+		if (size < sizeof(CFStringRef))
 			return kAudioHardwareBadPropertySizeError;
-		*(CFStringRef *)out = CFRetain(name);
-		*outsize = sizeof(name);
+		*(CFStringRef *)out = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
+		*outsize = sizeof(CFStringRef);
 		return noErr;
 	}
-	if (volume_port(obj) >= 0 && (a->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ||
-				  a->mSelector == kAudioLevelControlPropertyConvertDecibelsToScalar)) {
+	if (o && o->kind == VOLUME && (a->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ||
+				       a->mSelector == kAudioLevelControlPropertyConvertDecibelsToScalar)) {
 		if (size < sizeof(Float32))
 			return kAudioHardwareBadPropertySizeError;
 		Float32 v = *(Float32 *)out;
@@ -643,7 +829,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obj,
 		*outsize = sizeof(v);
 		return noErr;
 	}
-	UInt32 n = get(obj, a, size, out);
+	UInt32 n = get(obj, a, size, out);	/* CF values in out are created for the caller */
 	if (!n) {
 		unknown(obj, a, "GetPropertyData");
 		return kAudioHardwareUnknownPropertyError;
@@ -655,13 +841,6 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obj,
 	if (size < n)
 		return kAudioHardwareBadPropertySizeError;
 	*outsize = n;
-	/* CF values handed out are retained for the caller */
-	if (n == sizeof(CFStringRef) && (a->mSelector == kAudioObjectPropertyName ||
-					 a->mSelector == kAudioObjectPropertyManufacturer ||
-					 a->mSelector == kAudioDevicePropertyDeviceUID ||
-					 a->mSelector == kAudioDevicePropertyModelUID ||
-					 a->mSelector == kAudioPlugInPropertyResourceBundle))
-		CFRetain(*(CFStringRef *)out);
 	return noErr;
 }
 
@@ -669,43 +848,62 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obj,
 				const AudioObjectPropertyAddress *a, UInt32 qsize, const void *q,
 				UInt32 size, const void *data)
 {
-	if ((obj == kObjOutStream || obj == kObjInStream) && (a->mSelector == kAudioStreamPropertyVirtualFormat ||
-				     a->mSelector == kAudioStreamPropertyPhysicalFormat)) {
+	struct object *o = find(obj);
+	if (!o)
+		return kAudioHardwareBadObjectError;
+	if (o->kind == STREAM && (a->mSelector == kAudioStreamPropertyVirtualFormat ||
+				  a->mSelector == kAudioStreamPropertyPhysicalFormat)) {
 		/* only one format: accept it unchanged, refuse anything else */
 		AudioStreamBasicDescription f = stream_format();
 		if (size >= sizeof(f) && !memcmp(data, &f, sizeof(f)))
 			return noErr;
 		return kAudioDeviceUnsupportedFormatError;
 	}
-	if (size >= sizeof(Float32) && volume_port(obj) >= 0 &&
+	if (o->kind == VOLUME && size >= sizeof(Float32) &&
 	    (a->mSelector == kAudioLevelControlPropertyScalarValue ||
 	     a->mSelector == kAudioLevelControlPropertyDecibelValue)) {
 		Float32 v = *(const Float32 *)data;
-		Float32 *db = &volume_db[volume_port(obj)];
-		*db = a->mSelector == kAudioLevelControlPropertyDecibelValue ?
+		o->volume_db = a->mSelector == kAudioLevelControlPropertyDecibelValue ?
 		    fminf(fmaxf(v, MIN_DB), 0) : (1.0f - fminf(fmaxf(v, 0), 1)) * MIN_DB;
 		AudioObjectPropertyAddress ch[2] = {
 			{ kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
 			{ kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
 		};
 		host->PropertiesChanged(host, obj, 2, ch);
-		qlog("volume %u = %.1f dB", obj, *db);
+		qlog("volume %u = %.1f dB", obj, o->volume_db);
 		return noErr;
 	}
-	if (size >= sizeof(UInt32) && mute_port(obj) >= 0 &&
-	    a->mSelector == kAudioBooleanControlPropertyValue) {
-		UInt32 *v = &muted[mute_port(obj)];
-		*v = *(const UInt32 *)data != 0;
+	if (o->kind == MUTE && size >= sizeof(UInt32) && a->mSelector == kAudioBooleanControlPropertyValue) {
+		o->muted = *(const UInt32 *)data != 0;
 		AudioObjectPropertyAddress ch = { kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal,
 						  kAudioObjectPropertyElementMain };
 		host->PropertiesChanged(host, obj, 1, &ch);
-		qlog("mute %u = %u", obj, *v);
+		qlog("mute %u = %u", obj, o->muted);
 		return noErr;
 	}
-	if ((obj == kObjInSource || obj == kObjOutSource) && a->mSelector == kAudioSelectorControlPropertyCurrentItem) {
-		/* one source per direction: only it can be selected */
-		UInt32 want = obj == kObjInSource ? SRC_IN : SRC_OUT;
-		return size >= sizeof(UInt32) && *(const UInt32 *)data == want ? noErr : kAudioHardwareIllegalOperationError;
+	if (o->kind == SOURCE && a->mSelector == kAudioSelectorControlPropertyCurrentItem) {
+		/* any selection of our sources; VirtualAudio waits for the change notification */
+		UInt32 count = size / sizeof(UInt32), sel[4];
+		char c[8], line[64] = "";
+		if (count > 4)
+			return kAudioHardwareIllegalOperationError;
+		for (UInt32 i = 0; i < count; i++) {
+			sel[i] = ((const UInt32 *)data)[i];
+			unsigned k = 0;
+			while (k < nsources(o) && o->sources[k] != sel[i])
+				k++;
+			if (k == nsources(o))
+				return kAudioHardwareIllegalOperationError;
+			strlcat(line, " ", sizeof(line));
+			strlcat(line, fourcc(sel[i], c), sizeof(line));
+		}
+		memcpy(o->current, sel, count * sizeof(UInt32));
+		o->ncurrent = count;
+		AudioObjectPropertyAddress ch = { kAudioSelectorControlPropertyCurrentItem, kAudioObjectPropertyScopeGlobal,
+						  kAudioObjectPropertyElementMain };
+		host->PropertiesChanged(host, obj, 1, &ch);
+		qlog("source %u: selected%s", obj, line);
+		return noErr;
 	}
 	unknown(obj, a, "SetPropertyData");
 	return kAudioHardwareUnknownPropertyError;
@@ -715,12 +913,13 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obj,
 
 static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client)
 {
+	struct io *io = io_for(dev);
 	pthread_mutex_lock(&lock);
-	if (io_clients++ == 0) {
-		anchor_time = mach_absolute_time();
-		period_count = 0;
-		seed++;
-		qlog("IO started");
+	if (io->clients++ == 0) {
+		io->anchor_time = mach_absolute_time();
+		io->period_count = 0;
+		io->seed++;
+		qlog("IO started on device %u", dev);
 	}
 	pthread_mutex_unlock(&lock);
 	return noErr;
@@ -728,9 +927,10 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 
 
 static OSStatus StopIO(AudioServerPlugInDriverRef d, AudioObjectID dev, UInt32 client)
 {
+	struct io *io = io_for(dev);
 	pthread_mutex_lock(&lock);
-	if (io_clients && --io_clients == 0)
-		qlog("IO stopped after %llu frames", frames_seen);
+	if (io->clients && --io->clients == 0)
+		qlog("IO stopped on device %u after %llu frames", dev, io->frames);
 	pthread_mutex_unlock(&lock);
 	return noErr;
 }
@@ -739,14 +939,15 @@ static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID dev
 				 Float64 *sample_time, UInt64 *host_time, UInt64 *out_seed)
 {
 	/* the latest period boundary at or before now, on a 48 kHz host-time clock */
+	struct io *io = io_for(dev);
 	UInt64 now = mach_absolute_time();
 	Float64 ticks_per_period = ticks_per_frame * PERIOD;
-	UInt64 next = anchor_time + (UInt64)((period_count + 1) * ticks_per_period);
+	UInt64 next = io->anchor_time + (UInt64)((io->period_count + 1) * ticks_per_period);
 	if (now >= next)
-		period_count = (UInt64)((now - anchor_time) / ticks_per_period);
-	*sample_time = (Float64)period_count * PERIOD;
-	*host_time = anchor_time + (UInt64)(period_count * ticks_per_period);
-	*out_seed = seed;
+		io->period_count = (UInt64)((now - io->anchor_time) / ticks_per_period);
+	*sample_time = (Float64)io->period_count * PERIOD;
+	*host_time = io->anchor_time + (UInt64)(io->period_count * ticks_per_period);
+	*out_seed = io->seed;
 	return noErr;
 }
 
@@ -768,8 +969,9 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID dev, A
 			      UInt32 client, UInt32 op, UInt32 frames, const AudioServerPlugInIOCycleInfo *ci,
 			      void *main_buf, void *secondary)
 {
+	struct io *io = io_for(dev);
 	if (op == kAudioServerPlugInIOOperationReadInput) {
-		memset(main_buf, 0, frames * CHANNELS * sizeof(Float32));	/* no microphone yet */
+		memset(main_buf, 0, frames * CHANNELS * sizeof(Float32));	/* no microphone or telemetry yet */
 		return noErr;
 	}
 	if (op != kAudioServerPlugInIOOperationWriteMix)
@@ -777,14 +979,14 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID dev, A
 	const Float32 *s = main_buf;
 	for (UInt32 i = 0; i < frames * CHANNELS; i++) {
 		Float32 v = fabsf(s[i]);
-		if (v > peak)
-			peak = v;
+		if (v > io->peak)
+			io->peak = v;
 	}
-	frames_seen += frames;
-	if (frames_seen - last_report >= (UInt64)RATE) {
-		qlog("IO: %llu frames so far, peak %.3f in the last second", frames_seen, peak);
-		last_report = frames_seen;
-		peak = 0;
+	io->frames += frames;
+	if (io->frames - io->last_report >= (UInt64)RATE) {
+		qlog("IO on device %u: %llu frames so far, peak %.3f in the last second", dev, io->frames, io->peak);
+		io->last_report = io->frames;
+		io->peak = 0;
 	}
 	return noErr;
 }
