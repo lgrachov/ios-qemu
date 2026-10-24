@@ -49,7 +49,21 @@ enum {
 #define RATE		48000.0
 #define CHANNELS	2
 #define PERIOD		16384		/* frames between zero time stamps */
+/*
+ * QEMUAUDIO_AS_USB: present the device as a USB audio interface instead of
+ * the built-in codec. VirtualAudio's routing database rejects routes to the
+ * codec's ports ('nort'), while a newly connected USB device is a route iOS
+ * switches to by itself (experiment, 2026-10-25: fails, the HAL answers the
+ * USB location ID 'lcID' itself, from IOKit, and VirtualAudio gives up).
+ */
+#define QEMUAUDIO_AS_USB 0
+#if QEMUAUDIO_AS_USB
+#define DEVICE_UID	"cx.lev.ios-qemu.QEMUAudio"
+#define TRANSPORT	kAudioDeviceTransportTypeUSB
+#else
 #define DEVICE_UID	"Codec"
+#define TRANSPORT	kAudioDeviceTransportTypeBuiltIn
+#endif
 #define MODEL_UID	"cx.lev.ios-qemu.QEMUAudio.model"
 #define MIN_DB		-64.0f
 
@@ -151,6 +165,7 @@ static AudioStreamBasicDescription stream_format(void)
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
+#include <execinfo.h>
 
 static OSStatus (*real_get)(AudioObjectID, const AudioObjectPropertyAddress *, UInt32, const void *, UInt32 *, void *);
 static OSStatus (*real_size)(AudioObjectID, const AudioObjectPropertyAddress *, UInt32, const void *, UInt32 *);
@@ -196,13 +211,30 @@ static Boolean va_has(AudioObjectID o, const AudioObjectPropertyAddress *a)
 	return r;
 }
 
-static void *trace_fn[4], *trace_wrap[4] = { va_get, va_size, va_set, va_has };
+/* exceptions VirtualAudio throws: log the 4cc and a backtrace as offsets into VirtualAudio */
+static void (*real_throw)(void *, void *, void (*)(void *));
+static uintptr_t va_base;
+
+static void va_throw(void *thrown, void *tinfo, void (*dest)(void *))
+{
+	UInt32 code = *(UInt32 *)((uint8_t *)thrown + 8);	/* CAException: vtable, OSStatus */
+	char c[8], line[512];
+	void *bt[16];
+	int n = backtrace(bt, 16), off = 0;
+	for (int i = 1; i < n && off < (int)sizeof(line) - 20; i++)
+		off += snprintf(line + off, sizeof(line) - off, " %#lx", (uintptr_t)bt[i] - va_base);
+	qlog("VA throws '%s' from:%s", fourcc(code, c), line);
+	real_throw(thrown, tinfo, dest);
+}
+
+static void *trace_fn[5], *trace_wrap[5] = { va_get, va_size, va_set, va_has, va_throw };
 
 static void trace_image(const struct mach_header *mh, intptr_t slide)
 {
 	Dl_info info;
 	if (!dladdr(mh, &info) || !info.dli_fname || !strstr(info.dli_fname, "/VirtualAudio.plugin/"))
 		return;
+	va_base = (uintptr_t)mh;
 	unsigned long size;
 	uint8_t *got = getsectiondata((const struct mach_header_64 *)mh, "__DATA_CONST", "__got", &size);
 	if (!got)
@@ -216,7 +248,7 @@ static void trace_image(const struct mach_header *mh, intptr_t slide)
 	kern_return_t kr = vm_protect(mach_task_self(), page, len, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
 	int n = 0;
 	for (void **p = (void **)got; kr == KERN_SUCCESS && (uint8_t *)p < got + size; p++)
-		for (int k = 0; k < 4; k++)
+		for (int k = 0; k < 5; k++)
 			if (trace_fn[k] && *p == trace_fn[k]) {
 				*p = trace_wrap[k];
 				n++;
@@ -231,6 +263,7 @@ static void trace_va(void)
 	trace_fn[1] = real_size = dlsym(RTLD_DEFAULT, "AudioObjectGetPropertyDataSize");
 	trace_fn[2] = real_set = dlsym(RTLD_DEFAULT, "AudioObjectSetPropertyData");
 	trace_fn[3] = real_has = dlsym(RTLD_DEFAULT, "AudioObjectHasProperty");
+	trace_fn[4] = real_throw = dlsym(RTLD_DEFAULT, "__cxa_throw");
 	_dyld_register_func_for_add_image(trace_image);	/* also runs for images already loaded */
 }
 #endif
@@ -384,7 +417,15 @@ static UInt32 get(AudioObjectID obj, const AudioObjectPropertyAddress *a, UInt32
 		case kAudioObjectPropertyManufacturer: STR("ios-qemu"); break;
 		case kAudioDevicePropertyDeviceUID: STR(DEVICE_UID); break;
 		case kAudioDevicePropertyModelUID: STR(MODEL_UID); break;
-		case kAudioDevicePropertyTransportType: VAL(UInt32, kAudioDeviceTransportTypeBuiltIn); break;
+		case kAudioDevicePropertyTransportType: VAL(UInt32, TRANSPORT); break;
+#if QEMUAUDIO_AS_USB
+		case 'lcID': VAL(UInt32, 0x01100000); break;	/* USB location ID: bus 1, port 1 */
+		case kAudioObjectPropertyCustomPropertyInfoList:	/* the HAL forwards only declared custom properties */
+			VAL(AudioServerPlugInCustomPropertyInfo,
+			    ((AudioServerPlugInCustomPropertyInfo){ 'lcID', kAudioServerPlugInCustomPropertyDataTypeNone,
+								    kAudioServerPlugInCustomPropertyDataTypeNone }));
+			break;
+#endif
 		case kAudioDevicePropertyRelatedDevices: VAL(AudioObjectID, kObjDevice); break;
 		case kAudioDevicePropertyClockDomain: VAL(UInt32, 0); break;
 		case kAudioDevicePropertyDeviceIsAlive: VAL(UInt32, 1); break;
