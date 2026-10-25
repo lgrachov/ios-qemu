@@ -3,7 +3,7 @@
 # SWEET iOS root (case-sensitive journaled HFS+, OS root plus its cryptexes)
 # from the IPSW images, then wrap it as a UFS disk for qemu-sweet.py --ufs.
 #
-#   sudo mkiosroot-mac.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT_DIR [SIZE]   (SIZE default 16g)
+#   sudo mkiosroot-mac.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT_DIR [SIZE]   (SIZE default 32g: iOS 18 needs ~17 GB uncompressed)
 #
 # Writes OUT_DIR/root.hfs (the volume: the same thing mkiosroot.sh makes for
 # the phone's userdata) and OUT_DIR/disk.img (4 KiB-sector GPT "userdata"
@@ -19,7 +19,7 @@ set -euo pipefail
 [[ $# -ge 4 ]] || { sed -n '2,16p' "$0"; exit 2; }
 [[ $EUID == 0 ]] || { echo "run as root (sudo): the copy keeps root/mobile/_logd ownership" >&2; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
-os=$1 sysos=$2 appos=$3 outdir=$4 size=${5:-16g}
+os=$1 sysos=$2 appos=$3 outdir=$4 size=${5:-32g}
 RSYNC=/opt/homebrew/bin/rsync
 [[ -x $RSYNC ]] || RSYNC=/usr/local/bin/rsync
 [[ -x $RSYNC ]] || { echo "GNU rsync not found: brew install rsync" >&2; exit 1; }
