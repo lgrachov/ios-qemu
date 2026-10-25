@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 2545cf9f9a2a342972c6967f9d2bec78662d7058..c732a90d3341e50fc4bdc8733727552ac3df2030 100644
+index 2545cf9f9a2a342972c6967f9d2bec78662d7058..3163594769a8555f54cff4f603b485e62f6ee854 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
 @@ -17,6 +17,7 @@
@@ -10,17 +10,30 @@ index 2545cf9f9a2a342972c6967f9d2bec78662d7058..c732a90d3341e50fc4bdc8733727552a
  
  extern "C" void sweet_secondary_entry(void);
  extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
-@@ -24,6 +25,9 @@ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+@@ -24,6 +25,22 @@ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
  class SweetCPU;
  static SweetCPU *sweet_cpus[MAX_CPUS];
  static uint32_t sweet_cpus_registered;
 +/* PSCI conduit: smc to the phone's EL3 firmware; hvc under QEMU/hvf, whose virt
 + * board only answers hvc (ADT /cpus "psci-conduit" = "hvc", mkadt.py --qemu*). */
 +static bool sweet_psci_hvc;
++
++static void
++sweet_read_psci_conduit(void)
++{
++	DTEntry node;
++	void const *conduit = NULL;
++	unsigned int size = 0;
++	if (SecureDTLookupEntry(NULL, "/cpus", &node) == kSuccess &&
++	    SecureDTGetProperty(node, "psci-conduit", &conduit, &size) == kSuccess &&
++	    size >= 4 && strncmp((const char *)conduit, "hvc", 4) == 0) {
++		sweet_psci_hvc = true;
++	}
++}
  
  /* SMCCC 1.0: x0 is the signed PSCI result; do not assume x1-x17 survive. */
  static int32_t
-@@ -33,9 +37,15 @@ sweet_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
+@@ -33,9 +50,15 @@ sweet_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
  	register uint64_t x1 __asm__("x1") = target;
  	register uint64_t x2 __asm__("x2") = entry;
  	register uint64_t x3 __asm__("x3") = context;
@@ -39,7 +52,7 @@ index 2545cf9f9a2a342972c6967f9d2bec78662d7058..c732a90d3341e50fc4bdc8733727552a
  	return (int32_t)x0;
  }
  
-@@ -73,9 +83,11 @@ SweetCPU::start(IOService *provider)
+@@ -73,9 +96,11 @@ SweetCPU::start(IOService *provider)
  	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
  		return false;
  	}
@@ -54,24 +67,25 @@ index 2545cf9f9a2a342972c6967f9d2bec78662d7058..c732a90d3341e50fc4bdc8733727552a
  		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
  		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
  	}
-@@ -127,7 +139,16 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
- {
+@@ -99,6 +124,9 @@ SweetCPU::start(IOService *provider)
+ 	info.l3_cache_id = cpu->l3_cache_id;
+ 	info.l3_cache_size = cpu->l3_cache_size;
+ 	perfmon_interrupt_handler_func pmi_handler = NULL;
++	/* xnu-11417: ml_processor_register() starts the CPU (startCPU, PSCI
++	 * CPU_ON) right away, before startAll runs: know the conduit first. */
++	sweet_read_psci_conduit();
+ 	kern_return_t result = ml_processor_register(&info, &machProcessor, &ipi_handler, &pmi_handler);
+ 	if (result != KERN_SUCCESS) {
+ 		panic("SWEET CPU: ml_processor_register failed: %d", result);
+@@ -128,6 +156,7 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  	const ml_topology_info_t *topology = ml_get_topology_info();
  	uint32_t requested = 1;
-+	DTEntry node;
-+	void const *conduit = NULL;
-+	unsigned int size = 0;
  	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
-+	if (SecureDTLookupEntry(NULL, "/cpus", &node) == kSuccess &&
-+	    SecureDTGetProperty(node, "psci-conduit", &conduit, &size) == kSuccess &&
-+	    size >= 4 && strncmp((const char *)conduit, "hvc", 4) == 0) {
-+		sweet_psci_hvc = true;
-+	}
 +	IOLog("SWEET CPU: PSCI conduit %s\n", sweet_psci_hvc ? "hvc" : "smc");
  	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
  	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
  
-@@ -150,11 +171,9 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -150,11 +179,9 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  	}
  	for (unsigned int i = 0; i < topology->num_cpus; i++) {
  		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
