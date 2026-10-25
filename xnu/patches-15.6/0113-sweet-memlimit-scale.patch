@@ -1,0 +1,49 @@
+diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
+index bbc5d69618c5dabcb159ae82120847f4adb04fee..bedba7997f13e60e0173778e63e0358f20901693 100644
+--- a/bsd/kern/kern_memorystatus.c
++++ b/bsd/kern/kern_memorystatus.c
+@@ -1969,6 +1969,16 @@ initialize_entitled_max_task_limit()
+ #endif /* CONFIG_JETSAM */
+ 
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: iOS 18 daemons outgrow their JetsamProperties limits under QEMU
++ * (CPU rendering; iconservicesagent dies at its 6 MB inactive limit and
++ * DataMigration waits for its icons forever). Boot-arg sweetmemlimit
++ * multiplies every per-process limit (default 4, 1 = stock limits).
++ */
++static int32_t sweet_memlimit_scale = 4;
++#endif
++
+ __private_extern__ void
+ memorystatus_init(void)
+ {
+@@ -2002,6 +2012,10 @@ memorystatus_init(void)
+ 	nanoseconds_to_absolutetime(memstat_aging_stuck_time_s * NSEC_PER_SEC, &memorystatus_aging_stuck_delay_time);
+ 	assert3u(memstat_idle_deferral_time_s, >=, kJetsamSysProcsIdleDelayTimeLowRatio);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	PE_parse_boot_argn("sweetmemlimit", &sweet_memlimit_scale, sizeof(sweet_memlimit_scale));
++	printf("SWEET memorystatus: per-process memory limits x%d\n", sweet_memlimit_scale);
++#endif
+ #if CONFIG_JETSAM
+ 	bzero(memorystatus_jetsam_proc_name_panic, sizeof(memorystatus_jetsam_proc_name_panic));
+ 	if (PE_parse_boot_argn("jetsam_proc_name_panic", &memorystatus_jetsam_proc_name_panic, sizeof(memorystatus_jetsam_proc_name_panic))) {
+@@ -3175,6 +3189,16 @@ memstat_set_memlimits_locked(proc_t p, int32_t active_limit,
+ 		inactive_limit = inactive_limit + memlimit_increase;
+ 	}
+ #endif /* DEVELOPMENT || DEBUG */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sweet_memlimit_scale > 1) {
++		if (active_limit > 0) {
++			active_limit *= sweet_memlimit_scale;
++		}
++		if (inactive_limit > 0) {
++			inactive_limit *= sweet_memlimit_scale;
++		}
++	}
++#endif
+ 
+ 	memorystatus_log_debug(
+ 		"memorystatus: setting memlimit for %s [%d], "
