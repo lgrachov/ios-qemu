@@ -1,12 +1,16 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index e032cfb416463d156a0a8c32acfeb790b0d799ff..a62416cd28f2a729372066ad95221ec5315a6558 100644
+index e032cfb416463d156a0a8c32acfeb790b0d799ff..689160efad56c9b7b15cf39443eb195d73351a83 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -15,7 +15,12 @@
+@@ -14,8 +14,15 @@
+  *   4  SwapBegin -> [swap id]
   *   5  SwapEnd, struct 0x46c: +0x50 swap id, +0x54 IOSurface id per layer
   *      (4 layers), +0x64 rect a / +0xc4 rect b per layer (int x,y,w,h),
-  *      +0x104 enabled layer mask
+- *      +0x104 enabled layer mask
 - *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h], 18 IsMainDisplay,
++ *      +0x104 enabled layer mask. iOS 18 sends 0x514 bytes with the same
++ *      fields 0x48 bytes later (+0x98 swap id ... +0x14c mask); SwapEnd
++ *      moves them to the iOS 16 offsets.
 + *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h],
 + *   12 RequestPowerChange [state]: 0 = display off (backboardd, power
 + *      button / auto-lock), else on. Off fades the panel out over a few
@@ -16,7 +20,7 @@ index e032cfb416463d156a0a8c32acfeb790b0d799ff..a62416cd28f2a729372066ad95221ec5
   *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
   * Everything else is accepted and logged once.
   *
-@@ -53,6 +58,7 @@ enum {
+@@ -53,12 +60,15 @@ enum {
  	kSweetFBSwapWait                = 6,
  	kSweetFBGetID                   = 7,
  	kSweetFBGetDisplaySize          = 8,
@@ -24,7 +28,15 @@ index e032cfb416463d156a0a8c32acfeb790b0d799ff..a62416cd28f2a729372066ad95221ec5
  	kSweetFBIsMainDisplay           = 18,
  	kSweetFBGetDotPitch             = 28,
  	kSweetFBNotifications           = 72,
-@@ -108,6 +114,8 @@ public:
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
++#define SWEET_FB_SWAP_REC_SIZE_18       0x514
++#define SWEET_FB_SWAP_REC_SHIFT_18      0x48
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+@@ -108,6 +118,8 @@ public:
  	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
  	bool          fDirty;
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
@@ -33,7 +45,7 @@ index e032cfb416463d156a0a8c32acfeb790b0d799ff..a62416cd28f2a729372066ad95221ec5
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	void addClient(IOMobileFramebufferUserClient *client);
-@@ -216,6 +224,24 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -216,6 +228,24 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
  		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
  	}
@@ -58,7 +70,22 @@ index e032cfb416463d156a0a8c32acfeb790b0d799ff..a62416cd28f2a729372066ad95221ec5
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
  	uint8_t *rec = NULL;
  	if (flush) {
-@@ -506,6 +532,19 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -472,7 +502,13 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+-		memcpy(rec, args->structureInput, sizeof(rec));
++		if (args->structureInputSize >= SWEET_FB_SWAP_REC_SIZE_18) {
++			bzero(rec, sizeof(rec));
++			memcpy(rec + 0x50, (const uint8_t *)args->structureInput + 0x50 +
++			    SWEET_FB_SWAP_REC_SHIFT_18, sizeof(rec) - 0x50 - SWEET_FB_SWAP_REC_SHIFT_18);
++		} else {
++			memcpy(rec, args->structureInput, sizeof(rec));
++		}
+ 		fFB->swap(rec);
+ 		break;
+ 	}
+@@ -506,6 +542,19 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  			    args->scalarInput[0] ? "on" : "off");
  		}
  		break;
