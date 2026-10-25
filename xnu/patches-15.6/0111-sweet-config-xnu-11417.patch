@@ -130,3 +130,35 @@ index e305f0dd116e8e1fff1865203f47ad2a4d0d145c..89f7ea7bb314dd7c6b79059802be207b
  options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
  options   CONFIG_KERNEL_TBI		# <kernel_tbi>
 +options   CONFIG_KERNEL_TAGGING		# <kernel_tagging>
+diff --git a/osfmk/arm64/amcc_rorgn_ppl_amcc.c b/osfmk/arm64/amcc_rorgn_ppl_amcc.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b3fe0b769fbe7c876d486089bc87f63f2425f83
+--- /dev/null
++++ b/osfmk/arm64/amcc_rorgn_ppl_amcc.c
+@@ -0,0 +1,10 @@
++/*
++ * sweet (xnu-11417): files.arm64 builds this for nos_arm_asm + config_pmap_ppl,
++ * but the source only ships in Apple's closed per-SoC library, like
++ * amcc_rorgn_ppl.c (see patch 0008). The amcc read-only region needs Apple
++ * memory controller hardware; nothing references it on SWEET (no
++ * KERNEL_INTEGRITY_KTRR/CTRR).
++ */
++#include <stdint.h>
++
++static const uint8_t sweet_no_amcc_rorgn_amcc __attribute__((unused)) = 0;
+diff --git a/osfmk/arm64/amcc_rorgn_ppl_ctrr3.c b/osfmk/arm64/amcc_rorgn_ppl_ctrr3.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..c40621b4747046fed108d00ed50a895ee9aff557
+--- /dev/null
++++ b/osfmk/arm64/amcc_rorgn_ppl_ctrr3.c
+@@ -0,0 +1,10 @@
++/*
++ * sweet (xnu-11417): files.arm64 builds this for nos_arm_asm + config_pmap_ppl,
++ * but the source only ships in Apple's closed per-SoC library, like
++ * amcc_rorgn_ppl.c (see patch 0008). The ctrr3 read-only region needs Apple
++ * memory controller hardware; nothing references it on SWEET (no
++ * KERNEL_INTEGRITY_KTRR/CTRR).
++ */
++#include <stdint.h>
++
++static const uint8_t sweet_no_amcc_rorgn_ctrr3 __attribute__((unused)) = 0;
