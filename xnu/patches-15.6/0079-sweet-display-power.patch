@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index e032cfb416463d156a0a8c32acfeb790b0d799ff..689160efad56c9b7b15cf39443eb195d73351a83 100644
+index e032cfb416463d156a0a8c32acfeb790b0d799ff..6910f760d0744dbfb4bb70aa97eb56845c734f38 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -14,8 +14,15 @@
@@ -70,12 +70,32 @@ index e032cfb416463d156a0a8c32acfeb790b0d799ff..689160efad56c9b7b15cf39443eb195d
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
  	uint8_t *rec = NULL;
  	if (flush) {
-@@ -472,7 +502,13 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -472,7 +502,33 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  			ret = kIOReturnBadArgument;
  			break;
  		}
 -		memcpy(rec, args->structureInput, sizeof(rec));
 +		if (args->structureInputSize >= SWEET_FB_SWAP_REC_SIZE_18) {
++			static uint32_t dumped;
++			if (dumped < 4) {
++				/* Non-zero words of the first records, to check the layout. */
++				const uint8_t *in = (const uint8_t *)args->structureInput;
++				char line[160];
++				int n = 0;
++				dumped++;
++				for (uint32_t off = 0; off + 4 <= SWEET_FB_SWAP_REC_SIZE_18; off += 4) {
++					uint32_t v = get32(in, off);
++					if (v == 0) {
++						continue;
++					}
++					n += snprintf(line + n, sizeof(line) - n, " %x=%x", off, v);
++					if (n > (int)sizeof(line) - 24) {
++						IOLog("SWEET FB: rec18%s\n", line);
++						n = 0;
++					}
++				}
++				IOLog("SWEET FB: rec18%s (end)\n", n ? line : "");
++			}
 +			bzero(rec, sizeof(rec));
 +			memcpy(rec + 0x50, (const uint8_t *)args->structureInput + 0x50 +
 +			    SWEET_FB_SWAP_REC_SHIFT_18, sizeof(rec) - 0x50 - SWEET_FB_SWAP_REC_SHIFT_18);
@@ -85,7 +105,7 @@ index e032cfb416463d156a0a8c32acfeb790b0d799ff..689160efad56c9b7b15cf39443eb195d
  		fFB->swap(rec);
  		break;
  	}
-@@ -506,6 +542,19 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -506,6 +562,19 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  			    args->scalarInput[0] ? "on" : "off");
  		}
  		break;
