@@ -24,6 +24,10 @@
  * measure what they are given (peak level once a second in the log). Step 2
  * hands the samples to the kernel's virtio-sound driver.
  *
+ * VirtualAudio never routes to these devices (its routing database finds no
+ * route, so everything plays into its Null_Device). QEMUAUDIO_TAP takes the
+ * mix from VirtualAudio's IOProc on its "VAD Aggregate Device" instead.
+ *
  * Every property we do not answer is logged once, so the log shows what
  * VirtualAudio asks. Log: /private/var/tmp/QEMUAudio.log and os_log
  * ("QEMUAudio:").
@@ -38,7 +42,9 @@
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #define RATE		48000.0
@@ -247,7 +253,6 @@ static AudioStreamBasicDescription stream_format(void)
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <execinfo.h>
-#include <sys/sysctl.h>
 
 static OSStatus (*real_get)(AudioObjectID, const AudioObjectPropertyAddress *, UInt32, const void *, UInt32 *, void *);
 static OSStatus (*real_size)(AudioObjectID, const AudioObjectPropertyAddress *, UInt32, const void *, UInt32 *);
@@ -309,7 +314,141 @@ static void va_throw(void *thrown, void *tinfo, void (*dest)(void *))
 	real_throw(thrown, tinfo, dest);
 }
 
-static void *trace_fn[5], *trace_wrap[5] = { va_get, va_size, va_set, va_has, va_throw };
+/*
+ * QEMUAUDIO_TAP: VirtualAudio plays its default device through IOProcs it
+ * creates on the physical device the route ends on (its imports of
+ * AudioDeviceCreateIOProcID/Start/Stop). With no route but Null_Device that
+ * IOProc is the only place the mix exists, so wrap it: once VirtualAudio's
+ * proc has filled the output buffers, tap_output gets them (peak/RMS in the
+ * log now; the next step copies them to the virtio-sound ring).
+ */
+#define QEMUAUDIO_TAP 1
+#define TAP_REPORT	24000		/* frames between level lines */
+#define TAP_SILENT	20		/* silent periods between "silent" lines */
+
+/* AudioHardware.h (not in the iOS SDK) */
+typedef OSStatus (*AudioDeviceIOProc)(AudioObjectID, const AudioTimeStamp *, const AudioBufferList *, const AudioTimeStamp *,
+				      AudioBufferList *, const AudioTimeStamp *, void *);
+typedef AudioDeviceIOProc AudioDeviceIOProcID;
+
+struct tap {
+	AudioDeviceIOProc proc;
+	void *client;
+	AudioObjectID dev;
+	char name[64];
+	AudioStreamBasicDescription fmt;	/* virtual format of the device's first output stream */
+	UInt64 frames, calls;
+	Float32 peak;
+	double sumsq;
+	UInt64 nsamples;
+	UInt32 periods, silent;
+};
+
+static void tap_output(struct tap *t, const AudioBufferList *out)
+{
+	UInt32 frames = 0;
+	Boolean is_float = !t->fmt.mFormatID || (t->fmt.mFormatFlags & kAudioFormatFlagIsFloat);
+	UInt32 bits = t->fmt.mBitsPerChannel ? t->fmt.mBitsPerChannel : 32;
+	for (UInt32 b = 0; b < out->mNumberBuffers; b++) {
+		const AudioBuffer *buf = &out->mBuffers[b];
+		UInt32 n = buf->mDataByteSize / (bits / 8);
+		if (!buf->mData || !n)
+			continue;
+		if (buf->mNumberChannels && n / buf->mNumberChannels > frames)
+			frames = n / buf->mNumberChannels;
+		for (UInt32 i = 0; i < n; i++) {
+			float v = is_float ? ((const Float32 *)buf->mData)[i]
+			        : bits == 16 ? ((const SInt16 *)buf->mData)[i] / 32768.0f
+			        : ((const SInt32 *)buf->mData)[i] / 2147483648.0f;
+			float a = fabsf(v);
+			if (a > t->peak)
+				t->peak = a;
+			t->sumsq += (double)v * v;
+		}
+		t->nsamples += n;
+	}
+	t->frames += frames;
+	t->calls++;
+	if (t->frames / TAP_REPORT == (t->frames - frames) / TAP_REPORT)
+		return;
+	if (t->peak > 0 || t->periods == 0 || ++t->silent >= TAP_SILENT) {
+		qlog("tap: device %u (%s): %llu frames in %llu calls, %u buffers x %u ch, peak %.4f (%.1f dB), rms %.4f",
+		     t->dev, t->name, t->frames, t->calls, out->mNumberBuffers, out->mNumberBuffers ? out->mBuffers[0].mNumberChannels : 0,
+		     t->peak, t->peak > 0 ? 20 * log10f(t->peak) : -999.0f, t->nsamples ? sqrt(t->sumsq / t->nsamples) : 0);
+		t->silent = 0;
+	}
+	t->periods++;
+	t->peak = 0;
+	t->sumsq = 0;
+	t->nsamples = 0;
+}
+
+static OSStatus tap_ioproc(AudioObjectID dev, const AudioTimeStamp *now, const AudioBufferList *in, const AudioTimeStamp *in_time,
+			   AudioBufferList *out, const AudioTimeStamp *out_time, void *client)
+{
+	struct tap *t = client;
+	OSStatus r = t->proc(dev, now, in, in_time, out, out_time, t->client);
+	if (out && out->mNumberBuffers)
+		tap_output(t, out);
+	return r;
+}
+
+static OSStatus (*real_create_ioproc)(AudioObjectID, AudioDeviceIOProc, void *, AudioDeviceIOProcID *);
+static OSStatus (*real_start)(AudioObjectID, AudioDeviceIOProcID);
+static OSStatus (*real_stop)(AudioObjectID, AudioDeviceIOProcID);
+
+static OSStatus va_create_ioproc(AudioObjectID dev, AudioDeviceIOProc proc, void *client, AudioDeviceIOProcID *id)
+{
+	struct tap *t = proc ? calloc(1, sizeof(*t)) : NULL;
+	if (!t)
+		return real_create_ioproc(dev, proc, client, id);
+	t->proc = proc;
+	t->client = client;
+	t->dev = dev;
+	CFStringRef name = NULL;
+	UInt32 size = sizeof(name);
+	AudioObjectPropertyAddress a = { kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+	if (!real_get(dev, &a, 0, NULL, &size, &name) && name) {
+		CFStringGetCString(name, t->name, sizeof(t->name), kCFStringEncodingUTF8);
+		CFRelease(name);
+	}
+	AudioObjectID streams[8];
+	size = sizeof(streams);
+	a = (AudioObjectPropertyAddress){ kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain };
+	if (!real_get(dev, &a, 0, NULL, &size, streams) && size >= sizeof(AudioObjectID)) {
+		a = (AudioObjectPropertyAddress){ kAudioStreamPropertyVirtualFormat, kAudioObjectPropertyScopeGlobal,
+						  kAudioObjectPropertyElementMain };
+		size = sizeof(t->fmt);
+		if (real_get(streams[0], &a, 0, NULL, &size, &t->fmt))
+			memset(&t->fmt, 0, sizeof(t->fmt));
+	}
+	OSStatus err = real_create_ioproc(dev, tap_ioproc, t, id);
+	char f[8];
+	qlog("tap: VirtualAudio IOProc on device %u (%s) -> %d, id %p, format '%s' %.0f Hz %u ch %u bits flags %#x", dev, t->name,
+	     (int)err, id ? (void *)*id : NULL, fourcc(t->fmt.mFormatID, f), t->fmt.mSampleRate, t->fmt.mChannelsPerFrame,
+	     t->fmt.mBitsPerChannel, t->fmt.mFormatFlags);
+	if (err)
+		free(t);
+	return err;
+}
+
+static OSStatus va_devstart(AudioObjectID dev, AudioDeviceIOProcID id)
+{
+	OSStatus err = real_start(dev, id);
+	qlog("tap: AudioDeviceStart(%u, %p) -> %d", dev, (void *)id, (int)err);
+	return err;
+}
+
+static OSStatus va_devstop(AudioObjectID dev, AudioDeviceIOProcID id)
+{
+	OSStatus err = real_stop(dev, id);
+	qlog("tap: AudioDeviceStop(%u, %p) -> %d", dev, (void *)id, (int)err);
+	return err;
+}
+
+#define NTRACE 8
+static void *trace_fn[NTRACE], *trace_wrap[NTRACE] = { va_get, va_size, va_set, va_has, va_throw,
+						       va_create_ioproc, va_devstart, va_devstop };
 
 static void trace_image(const struct mach_header *mh, intptr_t slide)
 {
@@ -338,7 +477,7 @@ static void trace_image(const struct mach_header *mh, intptr_t slide)
 	kern_return_t kr = vm_protect(mach_task_self(), page, len, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
 	int n = 0;
 	for (void **p = (void **)got; kr == KERN_SUCCESS && (uint8_t *)p < got + size; p++)
-		for (int k = 0; k < 5; k++)
+		for (int k = 0; k < NTRACE; k++)
 			if (trace_fn[k] && *p == trace_fn[k]) {
 				*p = trace_wrap[k];
 				n++;
@@ -354,6 +493,11 @@ static void trace_va(void)
 	trace_fn[2] = real_set = dlsym(RTLD_DEFAULT, "AudioObjectSetPropertyData");
 	trace_fn[3] = real_has = dlsym(RTLD_DEFAULT, "AudioObjectHasProperty");
 	trace_fn[4] = real_throw = dlsym(RTLD_DEFAULT, "__cxa_throw");
+#if QEMUAUDIO_TAP
+	trace_fn[5] = real_create_ioproc = dlsym(RTLD_DEFAULT, "AudioDeviceCreateIOProcID");
+	trace_fn[6] = real_start = dlsym(RTLD_DEFAULT, "AudioDeviceStart");
+	trace_fn[7] = real_stop = dlsym(RTLD_DEFAULT, "AudioDeviceStop");
+#endif
 	_dyld_register_func_for_add_image(trace_image);	/* also runs for images already loaded */
 }
 #endif
