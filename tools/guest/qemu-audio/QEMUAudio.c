@@ -245,7 +245,8 @@ static AudioStreamBasicDescription stream_format(void)
  * Diagnostics (QEMUAUDIO_TRACE_VA): VirtualAudio.plugin's property reads of
  * our device fail inside the HAL without reaching us. Point VirtualAudio's
  * imports of the AudioObject* property calls at wrappers that log every
- * failure. Its __got holds plain pointers (arm64, no PAC).
+ * failure. The imports are in __got (arm64, iPhone X) or __auth_got (arm64e,
+ * XS); the guest kernel keeps the PAC keys off, so both hold plain pointers.
  */
 #define QEMUAUDIO_TRACE_VA 1
 #if QEMUAUDIO_TRACE_VA
@@ -523,34 +524,41 @@ static void trace_image(const struct mach_header *mh, intptr_t slide)
 	if (!dladdr(mh, &info) || !info.dli_fname || !strstr(info.dli_fname, "/VirtualAudio.plugin/"))
 		return;
 	va_base = (uintptr_t)mh;
-	/* which product VirtualAudio thinks it runs on: MobileGestalt's product
-	 * type hash -> VirtualAudio's product enum (fn 0x5026c, 0 = unknown) */
+	/* which product VirtualAudio thinks it runs on (MobileGestalt's product
+	 * type hash). No calls into VirtualAudio by offset: each iOS build and
+	 * device has its own (an iPhone X offset crashed mediaserverd on the XS). */
 	uint64_t (*mg_type)(void) = dlsym(RTLD_DEFAULT, "MGGetProductType");
 	char model[64] = "";
 	size_t msz = sizeof(model);
 	sysctlbyname("hw.model", model, &msz, NULL, 0);
-	qlog("trace: hw.model %s, MGGetProductType %#llx, VirtualAudio product %d", model,
-	     mg_type ? (unsigned long long)mg_type() : 0ULL, ((int (*)(void))(va_base + 0x5026c))());
-	unsigned long size;
-	uint8_t *got = getsectiondata((const struct mach_header_64 *)mh, "__DATA_CONST", "__got", &size);
-	if (!got)
-		got = getsectiondata((const struct mach_header_64 *)mh, "__DATA", "__got", &size);
-	if (!got) {
-		qlog("trace: no __got in VirtualAudio");
-		return;
+	qlog("trace: hw.model %s, MGGetProductType %#llx", model,
+	     mg_type ? (unsigned long long)mg_type() : 0ULL);
+	static const char *const sects[][2] = {
+		{ "__DATA_CONST", "__got" }, { "__DATA", "__got" },
+		{ "__DATA_CONST", "__auth_got" }, { "__AUTH_CONST", "__auth_got" }, { "__DATA", "__auth_got" },
+	};
+	int n = 0, found = 0;
+	for (size_t i = 0; i < sizeof(sects) / sizeof(sects[0]); i++) {
+		unsigned long size;
+		uint8_t *got = getsectiondata((const struct mach_header_64 *)mh, sects[i][0], sects[i][1], &size);
+		if (!got)
+			continue;
+		found++;
+		vm_address_t page = (vm_address_t)got & ~(vm_page_size - 1);
+		vm_size_t len = (vm_address_t)got + size - page;
+		kern_return_t kr = vm_protect(mach_task_self(), page, len, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+		for (void **p = (void **)got; kr == KERN_SUCCESS && (uint8_t *)p < got + size; p++)
+			for (int k = 0; k < NTRACE; k++)
+				if (trace_fn[k] && *p == trace_fn[k]) {
+					*p = trace_wrap[k];
+					n++;
+				}
+		vm_protect(mach_task_self(), page, len, false, VM_PROT_READ);
+		qlog("trace: %s,%s: vm_protect %d", sects[i][0], sects[i][1], kr);
 	}
-	vm_address_t page = (vm_address_t)got & ~(vm_page_size - 1);
-	vm_size_t len = (vm_address_t)got + size - page;
-	kern_return_t kr = vm_protect(mach_task_self(), page, len, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-	int n = 0;
-	for (void **p = (void **)got; kr == KERN_SUCCESS && (uint8_t *)p < got + size; p++)
-		for (int k = 0; k < NTRACE; k++)
-			if (trace_fn[k] && *p == trace_fn[k]) {
-				*p = trace_wrap[k];
-				n++;
-			}
-	vm_protect(mach_task_self(), page, len, false, VM_PROT_READ);
-	qlog("trace: %d VirtualAudio imports wrapped (vm_protect %d)", n, kr);
+	if (!found)
+		qlog("trace: no __got/__auth_got in VirtualAudio");
+	qlog("trace: %d VirtualAudio imports wrapped", n);
 }
 
 static void trace_va(void)
