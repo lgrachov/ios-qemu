@@ -1,0 +1,209 @@
+diff --git a/bsd/dev/sweet_vinput.c b/bsd/dev/sweet_vinput.c
+index 15509b94df1067665b93cadcb9b919157f3cbde4..e647bc8382d8f89adcfa747382dd65d1175715e9 100644
+--- a/bsd/dev/sweet_vinput.c
++++ b/bsd/dev/sweet_vinput.c
+@@ -10,8 +10,11 @@
+  *   virtio-tablet-device    BTN_LEFT/BTN_TOUCH + ABS_X/ABS_Y (0..32767 over the
+  *                           QEMU window) -> sweet_hid_touch(0, ...) in panel
+  *                           pixels (the boot framebuffer's size)
+- *   virtio-keyboard-device  P power, H/Escape home, Up/Down volume
+- *                           -> sweet_hid_key()
++ *   virtio-keyboard-device  a hardware keyboard: every key as its HID
++ *                           keyboard usage -> sweet_hid_keyboard() (iOS sees an
++ *                           external USB keyboard). Ctrl+Option (Alt) held:
++ *                           P power, H/Escape home, Up/Down volume
++ *                           -> sweet_hid_key() instead
+  *
+  * QEMU's virtio is cache coherent with the guest, so no cache maintenance.
+  * Needs -global virtio-mmio.force-legacy=false (modern register layout).
+@@ -33,6 +36,7 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ extern void sweet_hid_key(int key, int down);
++extern void sweet_hid_keyboard(uint32_t usage, int down);
+ void sweet_vinput_init(void);
+ 
+ #define VMMIO_PA        0x0a000000u
+@@ -77,12 +81,40 @@ void sweet_vinput_init(void);
+ #define BTN_LEFT        0x110
+ #define BTN_TOUCH       0x14a
+ #define KEY_ESC         1
++#define KEY_LEFTCTRL    29
++#define KEY_LEFTALT     56
++#define KEY_RIGHTCTRL   97
++#define KEY_RIGHTALT    100
+ #define KEY_P           25
+ #define KEY_H           35
+ #define KEY_UP          103
+ #define KEY_DOWN        108
+ #define ABS_RANGE       32768
+ 
++/* Linux input key codes (what virtio-input sends) -> HID keyboard page usages */
++static const uint8_t vinput_hid_usage[128] = {
++	[1] = 0x29,                                             /* Esc */
++	[2] = 0x1e, [3] = 0x1f, [4] = 0x20, [5] = 0x21, [6] = 0x22,     /* 1-5 */
++	[7] = 0x23, [8] = 0x24, [9] = 0x25, [10] = 0x26, [11] = 0x27,   /* 6-0 */
++	[12] = 0x2d, [13] = 0x2e, [14] = 0x2a, [15] = 0x2b,     /* - = Backspace Tab */
++	[16] = 0x14, [17] = 0x1a, [18] = 0x08, [19] = 0x15, [20] = 0x17, /* q w e r t */
++	[21] = 0x1c, [22] = 0x18, [23] = 0x0c, [24] = 0x12, [25] = 0x13, /* y u i o p */
++	[26] = 0x2f, [27] = 0x30, [28] = 0x28, [29] = 0xe0,     /* [ ] Enter LCtrl */
++	[30] = 0x04, [31] = 0x16, [32] = 0x07, [33] = 0x09, [34] = 0x0a, /* a s d f g */
++	[35] = 0x0b, [36] = 0x0d, [37] = 0x0e, [38] = 0x0f,     /* h j k l */
++	[39] = 0x33, [40] = 0x34, [41] = 0x35, [42] = 0xe1, [43] = 0x31, /* ; ' ` LShift \ */
++	[44] = 0x1d, [45] = 0x1b, [46] = 0x06, [47] = 0x19, [48] = 0x05, /* z x c v b */
++	[49] = 0x11, [50] = 0x10, [51] = 0x36, [52] = 0x37, [53] = 0x38, /* n m , . / */
++	[54] = 0xe5, [55] = 0x55, [56] = 0xe2, [57] = 0x2c, [58] = 0x39, /* RShift KP* LAlt Space Caps */
++	[59] = 0x3a, [60] = 0x3b, [61] = 0x3c, [62] = 0x3d, [63] = 0x3e, /* F1-F5 */
++	[64] = 0x3f, [65] = 0x40, [66] = 0x41, [67] = 0x42, [68] = 0x43, /* F6-F10 */
++	[86] = 0x64, [87] = 0x44, [88] = 0x45,                  /* 102nd F11 F12 */
++	[97] = 0xe4, [100] = 0xe6, [102] = 0x4a, [103] = 0x52,  /* RCtrl RAlt Home Up */
++	[104] = 0x4b, [105] = 0x50, [106] = 0x4f, [107] = 0x4d, /* PgUp Left Right End */
++	[108] = 0x51, [109] = 0x4e, [110] = 0x49, [111] = 0x4c, /* Down PgDn Ins Del */
++	[125] = 0xe3, [126] = 0xe7,                             /* LCmd RCmd */
++};
++
+ #define QSIZE           64u
+ #define MAX_DEVS        4u
+ /* One 16 KiB page per device: descriptors, avail ring, used ring, buffers. */
+@@ -117,6 +149,8 @@ static struct {
+ 	struct vinput_dev dev[MAX_DEVS];
+ 	unsigned ndev;
+ 	int abs_x, abs_y;
++	bool ctrl, alt;                 /* held, for the button combos */
++	uint64_t to_button[2];          /* keys whose press went to a button */
+ 	int panel_w, panel_h;
+ 	bool button, down;
+ 	bool started;
+@@ -217,11 +251,27 @@ vinput_event(const struct vinput_event *ev)
+ 	case EV_KEY:
+ 		if (ev->code == BTN_LEFT || ev->code == BTN_TOUCH) {
+ 			vi.button = ev->value != 0;
+-		} else if (ev->value <= 1) {    /* 2 = autorepeat */
+-			int key = ev->code == KEY_P ? 0 : ev->code == KEY_UP ? 1 :
+-			    ev->code == KEY_DOWN ? 2 : (ev->code == KEY_H || ev->code == KEY_ESC) ? 3 : -1;
+-			if (key >= 0) {
+-				sweet_hid_key(key, (int)ev->value);
++		} else if (ev->value <= 1 && ev->code < 128) {      /* 2 = autorepeat */
++			unsigned code = ev->code;
++			uint64_t bit = 1ull << (code & 63);
++			bool down = ev->value != 0;
++			if (code == KEY_LEFTCTRL || code == KEY_RIGHTCTRL) {
++				vi.ctrl = down;
++			} else if (code == KEY_LEFTALT || code == KEY_RIGHTALT) {
++				vi.alt = down;
++			}
++			int key = code == KEY_P ? 0 : code == KEY_UP ? 1 :
++			    code == KEY_DOWN ? 2 : (code == KEY_H || code == KEY_ESC) ? 3 : -1;
++			/* A button press keeps its release even if Ctrl/Option go up first. */
++			if (key >= 0 && (down ? (vi.ctrl && vi.alt) : (vi.to_button[code >> 6] & bit) != 0)) {
++				if (down) {
++					vi.to_button[code >> 6] |= bit;
++				} else {
++					vi.to_button[code >> 6] &= ~bit;
++				}
++				sweet_hid_key(key, down);
++			} else if (vinput_hid_usage[code]) {
++				sweet_hid_keyboard(vinput_hid_usage[code], down);
+ 			}
+ 		}
+ 		break;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 8390417cd233b181448de691b138177f07b0ba9a..1ae32027fa0694a02d78df431d16d5ca438c1923 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -11,9 +11,11 @@
+  *
+  *   SweetHIDButtons  consumer-control keys (power, volume, home)
+  *   SweetHIDTouch    the built-in touch screen (digitizer collections)
++ *   SweetHIDKeyboard an external "USB" keyboard (QEMU's virtio-keyboard,
++ *                    bsd/dev/sweet_vinput.c), keyboard/keypad page usages
+  *
+  * Hardware drivers feed them through the C entry points sweet_hid_key()
+- * and sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
++ * sweet_hid_touch() and sweet_hid_keyboard(). Boot-arg sweethidtest=N (seconds) presses Home
+  * every N seconds, to test the event path without input hardware.
+  */
+ #include <IOKit/IOLib.h>
+@@ -379,6 +381,50 @@ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
+ 
++/*
++ * Not built-in and on "USB", so backboardd/UIKit treat it as an attached
++ * hardware keyboard: text fields take its keys and hide the on-screen one.
++ */
++class SweetHIDKeyboard : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDKeyboard);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void key(UInt32 usage, bool down);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_GenericDesktop; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_GD_Keyboard; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 3; }
++	virtual OSString *getTransport() APPLE_KEXT_OVERRIDE { return OSString::withCString("USB"); }
++	virtual OSString *getProduct() APPLE_KEXT_OVERRIDE { return OSString::withCString("Sweet USB Keyboard"); }
++};
++OSDefineMetaClassAndStructors(SweetHIDKeyboard, IOHIDEventService);
++
++static SweetHIDKeyboard *gSweetKeyboard;
++
++bool
++SweetHIDKeyboard::start(IOService *provider)
++{
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOHIDBuiltInKey, kOSBooleanFalse);
++	gSweetKeyboard = this;
++	registerService();
++	IOLog("SWEET HID: keyboard registered\n");
++	return true;
++}
++
++void
++SweetHIDKeyboard::key(UInt32 usage, bool down)
++{
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_KeyboardOrKeypad, usage, down);
++
++	if (event) {
++		dispatchEvent(event);
++		event->release();
++	}
++}
++
+ bool
+ SweetHIDButtons::start(IOService *provider)
+ {
+@@ -566,6 +612,15 @@ sweet_hid_key(int key, int down)
+ 	}
+ }
+ 
++/* usage: keyboard/keypad page (0x07) usage, e.g. 0x04 'a', 0xe0 left control */
++extern "C" void
++sweet_hid_keyboard(uint32_t usage, int down)
++{
++	if (gSweetKeyboard) {
++		gSweetKeyboard->key(usage, down != 0);
++	}
++}
++
+ extern "C" void
+ sweet_hid_touch(int finger, int down, int x, int y)
+ {
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 8a739eae1cc234023e560b0d718d27c6d6b6b67f..cff106dea09514fd4d18d4eac49c31c2dac476f8 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -83,6 +83,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetHIDKeyboard;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDKeyboard;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"

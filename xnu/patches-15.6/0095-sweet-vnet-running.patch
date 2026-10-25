@@ -1,0 +1,14 @@
+diff --git a/bsd/dev/sweet_vnet.c b/bsd/dev/sweet_vnet.c
+index c2f5666ffad1373209e21696b6c327416964085e..23f83c662caa6bca5d3c308518704a437ffd2481 100644
+--- a/bsd/dev/sweet_vnet.c
++++ b/bsd/dev/sweet_vnet.c
+@@ -398,7 +398,8 @@ vnet_if_create(void)
+ 	ifnet_set_hdrlen(vn.ifp, sizeof(struct ether_header));
+ 	ifnet_set_mtu(vn.ifp, ETHERMTU);
+ 	ifnet_set_baudrate(vn.ifp, 1000000000);
+-	ifnet_set_flags(vn.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	/* RUNNING: the virtqueues are live; arp_lookup_ip() drops IP output with ENETDOWN without it */
++	ifnet_set_flags(vn.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST | IFF_RUNNING, 0xffff);
+ 	if (ifnet_attach(vn.ifp, NULL) != 0) {
+ 		vn.ifp = NULL;
+ 		return ENXIO;

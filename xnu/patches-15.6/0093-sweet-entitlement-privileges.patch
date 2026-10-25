@@ -1,0 +1,50 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cb67b4db110fe51553660e6e1e37463e401aa148..82eea021a6a147d9f26f329e6e48b1a017f2ec64 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -315,7 +315,29 @@ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+  * apps die in CoreAnimation setup: work_interval_create(CA_CLIENT) needs
+  * PRIV_WORK_INTERVAL ("Failed to create work interval", SpringBoard).
+  * Grant that one; log the first denial of each other privilege per process.
++ *
++ * Privileges that AMFI grants for an entitlement are granted the same way
++ * here, from the caller's code signature: without
++ * com.apple.private.network.socket-delegate -> PRIV_NET_PRIVILEGED_SOCKET_DELEGATE,
++ * NECP refused mDNSResponder and WebKit's Networking process ("does not hold
++ * the necessary entitlement to delegate network traffic for other
++ * processes") and no DNS query or page load ever left the device. The names
++ * are the ones on the iOS 16.7 binaries (mDNSResponder) and in this kernel.
+  */
++static const struct {
++	int priv;
++	const char *entitlement;
++} sweet_priv_entitlements[] = {
++	{ PRIV_NET_PRIVILEGED_SOCKET_DELEGATE, "com.apple.private.network.socket-delegate" },
++	{ PRIV_NET_PRIVILEGED_NECP_POLICIES, "com.apple.private.necp.policies" },
++	{ PRIV_NET_RESTRICTED_AWDL, "com.apple.private.network.awdl.restricted" },
++	{ PRIV_NET_PRIVILEGED_NECP_MATCH, "com.apple.private.necp.match" },
++	{ PRIV_NET_RESTRICTED_INTCOPROC, "com.apple.private.network.intcoproc.restricted" },
++	{ PRIV_NET_PRIVILEGED_CLIENT_ACCESS, "com.apple.security.network.client" },
++	{ PRIV_NET_PRIVILEGED_SERVER_ACCESS, "com.apple.security.network.server" },
++	{ PRIV_NET_RESTRICTED_MANAGEMENT_DATA, "com.apple.private.network.management.data" },
++	{ PRIV_NETINET_RESERVEDPORT, "com.apple.private.network.reserved-port" },
++};
+ #define SWEET_PRIV_LOG_MAX      64
+ static struct {
+ 	int  priv;
+@@ -329,6 +351,15 @@ sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
+ 	if (priv == PRIV_WORK_INTERVAL) {
+ 		return 0;
+ 	}
++	for (size_t i = 0; i < sizeof(sweet_priv_entitlements) / sizeof(sweet_priv_entitlements[0]); i++) {
++		if (sweet_priv_entitlements[i].priv == priv) {
++			void *ent = sweet_proc_entitlements(current_proc());
++			if (ent != NULL && sweet_entitlements_bool(ent, sweet_priv_entitlements[i].entitlement)) {
++				return 0;
++			}
++			break;
++		}
++	}
+ 	char name[20];
+ 	proc_selfname(name, sizeof(name));
+ 	for (int i = 0; i < sweet_priv_logged_count; i++) {

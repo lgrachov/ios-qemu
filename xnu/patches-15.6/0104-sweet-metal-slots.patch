@@ -1,0 +1,276 @@
+diff --git a/iokit/Kernel/arm/SweetMetal.cpp b/iokit/Kernel/arm/SweetMetal.cpp
+index 0391163d963dbddf0fa8873dee5a17af81a4597e..5170d9212b3bf34b8be5e7ac473bcc535e3450cf 100644
+--- a/iokit/Kernel/arm/SweetMetal.cpp
++++ b/iokit/Kernel/arm/SweetMetal.cpp
+@@ -1,29 +1,77 @@
+ /*
+- * Metal device discovery marker for SWEET (boot-arg sweetmetal=1).
++ * Metal device discovery and shared-memory slots for SWEET (boot-arg
++ * sweetmetal=1).
+  *
+  * iOS 16 Metal.framework (MTLRegisterDevices) walks
+  * IOServiceGetMatchingServices(IOServiceMatching("IOAcceleratorES")),
+  * reads MetalPluginName / MetalPluginClassName from each service, loads
+  * /System/Library/Extensions/<MetalPluginName>.bundle and creates the
+  * device with [[<MetalPluginClassName> alloc] initWithAcceleratorPort:
+- * service] (the class must be a subclass of _MTLDevice). This service only
+- * carries those two properties: there is no GPU and no user client; the
+- * guest bundle QEMUMetal does the rest in userland. Off by default, so
+- * without the boot-arg nothing changes and CoreAnimation keeps its CPU
+- * renderer.
++ * service] (the class must be a subclass of _MTLDevice). There is no GPU:
++ * the guest bundle QEMUMetal records Metal commands and a helper on the
++ * host replays them on the host's Metal.
++ *
++ * They talk through a shared region: QEMU's ivshmem-plain BAR2, which the
++ * boot stub places at boot-arg sweetmetal_pa (default 0x20000000, 256 MiB).
++ * The region is split into SWEET_METAL_SLOTS slots; opening this service's
++ * user client and calling selector 0 gives the process a free slot, mapped
++ * into it (cacheable: the BAR is ordinary host memory). The kernel owns the
++ * first words of each slot header (layout: tools/guest/qemu-metal/qmtl.h):
++ * it fills them on attach and marks the slot free again when the client
++ * closes or the process dies, bumping the generation either way so the
++ * host drops that process's objects.
++ *
++ * Off by default, so without the boot-arg nothing changes and CoreAnimation
++ * keeps its CPU renderer.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <libkern/OSAtomic.h>
+ #include <pexpert/pexpert.h>
++#include <sys/proc.h>
++
++/* tools/guest/qemu-metal/qmtl.h */
++#define SWEET_METAL_SIZE        0x10000000ULL
++#define SWEET_METAL_SLOTS       8
++#define SWEET_METAL_SLOT_SIZE   (SWEET_METAL_SIZE / SWEET_METAL_SLOTS)
++#define SWEET_METAL_MAGIC       0x4c544d51      /* 'QMTL' */
++#define SWEET_METAL_VERSION     1
++
++struct sweet_metal_slot {
++	uint32_t magic;
++	uint32_t version;
++	uint32_t state;                 /* 0 free, 1 open */
++	uint32_t generation;
++	int32_t pid;
++	char name[36];
++	uint64_t head;
++	uint64_t submitted;
++	uint64_t tail;
++	uint64_t completed;
++};
+ 
+ class IOAcceleratorES : public IOService {
+ 	OSDeclareDefaultStructors(IOAcceleratorES);
+ 
++	IOLock *fLock;
++	IOMemoryMap *fKernelMap;
++	uint64_t fPhys;
++	bool fBusy[SWEET_METAL_SLOTS];
++
++	struct sweet_metal_slot *header(int slot);
++
+ public:
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++
++	int attach(task_t task, IOMemoryMap **mapOut);
++	void detach(int slot);
++	uint32_t generation(int slot);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+@@ -36,13 +84,185 @@ IOAcceleratorES::start(IOService *provider)
+ 	if (!PE_parse_boot_argn("sweetmetal", &enabled, sizeof(enabled)) || !enabled) {
+ 		return false;
+ 	}
+-	if (!IOService::start(provider)) {
++	fPhys = 0x20000000ULL;
++	PE_parse_boot_argn("sweetmetal_pa", &fPhys, sizeof(fPhys));
++	fLock = IOLockAlloc();
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fPhys, SWEET_METAL_SIZE, kIODirectionInOut);
++	if (md != NULL) {
++		fKernelMap = md->map(kIOMapCopybackCache);
++		md->release();
++	}
++	if (fLock == NULL || fKernelMap == NULL || !IOService::start(provider)) {
++		IOLog("SWEET METAL: no shared region at %#llx\n", fPhys);
+ 		return false;
+ 	}
++	for (int i = 0; i < SWEET_METAL_SLOTS; i++) {
++		struct sweet_metal_slot *h = header(i);
++		h->state = 0;
++		h->pid = 0;
++		h->magic = SWEET_METAL_MAGIC;
++		h->version = SWEET_METAL_VERSION;
++	}
+ 	setProperty("MetalPluginName", "QEMUMetal");
+ 	setProperty("MetalPluginClassName", "QEMUMTLDevice");
++	setProperty(kIOUserClientClassKey, "IOAcceleratorESUserClient");
+ 	registerService();
+-	IOLog("SWEET METAL: IOAcceleratorES registered (plugin QEMUMetal / QEMUMTLDevice)\n");
++	IOLog("SWEET METAL: IOAcceleratorES registered (plugin QEMUMetal / QEMUMTLDevice, %d slots at %#llx)\n",
++	    SWEET_METAL_SLOTS, fPhys);
+ 	return true;
+ }
++
++struct sweet_metal_slot *
++IOAcceleratorES::header(int slot)
++{
++	return (struct sweet_metal_slot *)(fKernelMap->getVirtualAddress() + slot * SWEET_METAL_SLOT_SIZE);
++}
++
++/* Give task a free slot, mapped into it; -1 if none is free. */
++int
++IOAcceleratorES::attach(task_t task, IOMemoryMap **mapOut)
++{
++	int slot = -1;
++
++	IOLockLock(fLock);
++	for (int i = 0; i < SWEET_METAL_SLOTS; i++) {
++		if (!fBusy[i]) {
++			fBusy[i] = true;
++			slot = i;
++			break;
++		}
++	}
++	IOLockUnlock(fLock);
++	if (slot < 0) {
++		return -1;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fPhys + slot * SWEET_METAL_SLOT_SIZE,
++	    SWEET_METAL_SLOT_SIZE, kIODirectionInOut);
++	*mapOut = md != NULL ? md->createMappingInTask(task, 0, kIOMapAnywhere | kIOMapCopybackCache) : NULL;
++	OSSafeReleaseNULL(md);
++	if (*mapOut == NULL) {
++		IOLockLock(fLock);
++		fBusy[slot] = false;
++		IOLockUnlock(fLock);
++		return -1;
++	}
++
++	struct sweet_metal_slot *h = header(slot);
++	h->head = h->submitted = h->tail = h->completed = 0;
++	h->pid = proc_selfpid();
++	proc_selfname(h->name, sizeof(h->name));
++	h->magic = SWEET_METAL_MAGIC;
++	h->version = SWEET_METAL_VERSION;
++	h->generation++;
++	OSMemoryBarrier();
++	h->state = 1;
++	OSMemoryBarrier();
++	IOLog("SWEET METAL: slot %d -> %s[%d]\n", slot, h->name, h->pid);
++	return slot;
++}
++
++uint32_t
++IOAcceleratorES::generation(int slot)
++{
++	return header(slot)->generation;
++}
++
++void
++IOAcceleratorES::detach(int slot)
++{
++	struct sweet_metal_slot *h = header(slot);
++	h->state = 0;
++	OSMemoryBarrier();
++	h->generation++;
++	h->pid = 0;
++	OSMemoryBarrier();
++	IOLockLock(fLock);
++	fBusy[slot] = false;
++	IOLockUnlock(fLock);
++}
++
++class IOAcceleratorESUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(IOAcceleratorESUserClient);
++
++	task_t fTask;
++	int fSlot;
++	IOMemoryMap *fMap;
++
++	void release_slot();
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	void free() APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorESUserClient, IOUserClient);
++
++bool
++IOAcceleratorESUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
++		return false;
++	}
++	fTask = owningTask;
++	fSlot = -1;
++	return true;
++}
++
++void
++IOAcceleratorESUserClient::release_slot()
++{
++	IOAcceleratorES *acc = OSDynamicCast(IOAcceleratorES, getProvider());
++	if (fSlot >= 0 && acc != NULL) {
++		acc->detach(fSlot);
++	}
++	fSlot = -1;
++	OSSafeReleaseNULL(fMap);
++}
++
++void
++IOAcceleratorESUserClient::free()
++{
++	release_slot();
++	IOUserClient::free();
++}
++
++/* also runs when the process dies (clientDied) */
++IOReturn
++IOAcceleratorESUserClient::clientClose(void)
++{
++	release_slot();
++	terminate();
++	return kIOReturnSuccess;
++}
++
++/*
++ * Selector 0, attach: no input; out 4 scalars = slot index, user address of
++ * the slot, slot size, generation.
++ */
++IOReturn
++IOAcceleratorESUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	IOAcceleratorES *acc = OSDynamicCast(IOAcceleratorES, getProvider());
++
++	if (selector != 0 || acc == NULL || args->scalarOutputCount < 4) {
++		return kIOReturnUnsupported;
++	}
++	if (fSlot < 0) {
++		fSlot = acc->attach(fTask, &fMap);
++		if (fSlot < 0) {
++			return kIOReturnNoResources;
++		}
++	}
++	args->scalarOutput[0] = (uint64_t)fSlot;
++	args->scalarOutput[1] = fMap->getAddress();
++	args->scalarOutput[2] = fMap->getLength();
++	args->scalarOutput[3] = acc->generation(fSlot);
++	return kIOReturnSuccess;
++}
+ #endif /* SWEET */

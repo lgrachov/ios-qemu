@@ -1,0 +1,514 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 16750eb172145ede8a37405308f714aef11888df..833a3652ca306f6e8dd4036478251baa7364e089 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_mux.c			standard
+ bsd/dev/sweet_vinput.c			standard
+ bsd/dev/sweet_vnet.c			standard
++bsd/dev/sweet_vsnd.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index b03729a9831e808768aa61ed59295ec2fdb095e0..ab5c349b1b768527b5e4f5afcb595ee247b7dbb8 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -56,6 +56,7 @@ extern void sweet_usb_probe(void);
+ extern void sweet_vinput_init(void);
+ extern void sweet_vnet_init(void);
+ extern void sweet_mux_init(void);
++extern void sweet_vsnd_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -666,6 +667,7 @@ sweet_ufs_init(void)
+ 	sweet_vinput_init();         /* QEMU only (boot-arg sweetvinput=1) */
+ 	sweet_vnet_init();           /* QEMU only (boot-arg sweetvnet=1) */
+ 	sweet_mux_init();            /* QEMU only, lockdownd over en0 (sweetvnet=1) */
++	sweet_vsnd_init();           /* QEMU only (boot-arg sweetvsnd=1) */
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_vsnd.c b/bsd/dev/sweet_vsnd.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..b7b7c979821727fe288d0098b334326b8d7e8fd4
+--- /dev/null
++++ b/bsd/dev/sweet_vsnd.c
+@@ -0,0 +1,476 @@
++/*
++ * SWEET under QEMU: virtio-sound (virtio-mmio, modern) playback.
++ *
++ * Boot-arg sweetvsnd=1 (harness.sh --ios unless --no-audio; never on the
++ * phone). Finds QEMU virt's virtio-mmio sound device (ID 25), negotiates
++ * only VIRTIO_F_VERSION_1, picks the first output PCM stream that takes
++ * S16 stereo at 44100 Hz and keeps it running (SET_PARAMS, PREPARE, START).
++ *
++ * The guest side is /dev/qemuaudio: write() takes interleaved S16LE stereo
++ * at 44100 Hz (QEMUAudio.driver in mediaserverd writes VirtualAudio's mix
++ * there) into a ring and never blocks: what does not fit is dropped. One
++ * thread polls every 2 ms, hands whole periods from the ring to the TX
++ * queue (at most TX_INFLIGHT in flight) and reclaims the ones QEMU has
++ * played; QEMU returns a TX buffer once its audio backend consumed it, so
++ * the used ring paces playback. With nothing queued QEMU plays silence.
++ *
++ * QEMU's virtio is cache coherent with the guest, so no cache maintenance.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/locks.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern kern_return_t thread_terminate(thread_t);
++void sweet_vsnd_init(void);
++
++#define VMMIO_PA        0x0a000000u
++#define VMMIO_STRIDE    0x200u
++#define VMMIO_SLOTS     32u
++
++#define VM_MAGIC        0x000
++#define VM_VERSION      0x004
++#define VM_DEVICE_ID    0x008
++#define VM_DEV_FEAT     0x010
++#define VM_DEV_FEAT_SEL 0x014
++#define VM_DRV_FEAT     0x020
++#define VM_DRV_FEAT_SEL 0x024
++#define VM_QUEUE_SEL    0x030
++#define VM_QUEUE_MAX    0x034
++#define VM_QUEUE_NUM    0x038
++#define VM_QUEUE_READY  0x044
++#define VM_QUEUE_NOTIFY 0x050
++#define VM_INT_STATUS   0x060
++#define VM_INT_ACK      0x064
++#define VM_STATUS       0x070
++#define VM_DESC_LO      0x080
++#define VM_DESC_HI      0x084
++#define VM_AVAIL_LO     0x090
++#define VM_AVAIL_HI     0x094
++#define VM_USED_LO      0x0a0
++#define VM_USED_HI      0x0a4
++#define VM_CONFIG       0x100           /* virtio_snd_config: jacks, streams, chmaps */
++
++#define ST_ACK          1u
++#define ST_DRIVER       2u
++#define ST_DRIVER_OK    4u
++#define ST_FEATURES_OK  8u
++#define VIRTIO_F_VERSION_1_HI 1u        /* feature bit 32 */
++#define VIRTIO_ID_SOUND 25u
++#define VRING_DESC_F_NEXT  1u
++#define VRING_DESC_F_WRITE 2u
++
++/* virtio-snd (virtio 1.2, 5.14) */
++#define SND_R_PCM_INFO       0x0100u
++#define SND_R_PCM_SET_PARAMS 0x0101u
++#define SND_R_PCM_PREPARE    0x0102u
++#define SND_R_PCM_START      0x0104u
++#define SND_S_OK             0x8000u
++#define SND_D_OUTPUT         0u
++#define SND_FMT_S16          5u
++#define SND_RATE_44100       6u
++#define CTLQ            0u
++#define TXQ             2u
++
++#define QSIZE           64u
++#define FRAME_BYTES     4u              /* S16 stereo */
++#define PERIOD_BYTES    (512u * FRAME_BYTES)
++#define TX_SLOTS        16u             /* 3 descriptors each */
++#define TX_INFLIGHT     8u              /* ~93 ms queued at most */
++#define RING_BYTES      (16u * PERIOD_BYTES)
++#define MAX_STREAMS     8u
++/* One contiguous allocation: per queue a 4 KiB ring page, then the buffers. */
++#define RING_DESC       0x000           /* 16 * QSIZE */
++#define RING_AVAIL      0x400           /* 4 + 2 * QSIZE */
++#define RING_USED       0x800           /* 4 + 8 * QSIZE */
++#define OFF_RING(q)     ((q) == CTLQ ? 0x0000u : 0x1000u)
++#define OFF_CTL_REQ     0x2000u
++#define OFF_CTL_RESP    0x2200u         /* up to 4 + 32 * MAX_STREAMS */
++#define OFF_TX_HDR(s)   (0x2600u + (s) * 16u)   /* xfer (4), status (8) at +4 */
++#define OFF_TX_DATA(s)  (0x3000u + (s) * PERIOD_BYTES)
++#define DMA_SIZE        (0x3000u + TX_SLOTS * PERIOD_BYTES)
++
++struct vring_desc {
++	uint64_t addr;
++	uint32_t len;
++	uint16_t flags;
++	uint16_t next;
++};
++
++struct snd_pcm_info {
++	uint32_t hda_fn_nid;
++	uint32_t features;
++	uint64_t formats;
++	uint64_t rates;
++	uint8_t direction;
++	uint8_t channels_min;
++	uint8_t channels_max;
++	uint8_t padding[5];
++} __attribute__((packed));
++
++static struct {
++	vm_offset_t regs;
++	vm_offset_t dma;
++	uint64_t dma_pa;
++	uint16_t ctl_avail, ctl_used;
++	uint16_t tx_avail, tx_used;
++	uint32_t stream;
++	uint32_t slot_busy;             /* bit per TX slot */
++	uint8_t *ring;                  /* PCM from /dev/qemuaudio */
++	uint32_t head, len;             /* ring read position, bytes queued */
++	uint64_t written, dropped, played, errors;
++	lck_mtx_t *lock;                /* ring */
++	bool started, ready;
++} vs;
++static int vsnd_sleep_chan;
++
++static uint32_t
++vm_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(vs.regs + off);
++}
++
++static void
++vm_wr(uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb ish" ::: "memory");
++	*(volatile uint32_t *)(vs.regs + off) = val;
++}
++
++static volatile uint16_t *
++ring16(unsigned q, uint32_t off)
++{
++	return (volatile uint16_t *)(vs.dma + OFF_RING(q) + off);
++}
++
++static struct vring_desc *
++ring_desc(unsigned q)
++{
++	return (struct vring_desc *)(vs.dma + OFF_RING(q) + RING_DESC);
++}
++
++static void
++vsnd_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&vsnd_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++vsnd_queue_setup(unsigned q)
++{
++	uint64_t ring = vs.dma_pa + OFF_RING(q);
++	vm_wr(VM_QUEUE_SEL, q);
++	vm_wr(VM_QUEUE_NUM, QSIZE);
++	vm_wr(VM_DESC_LO, (uint32_t)(ring + RING_DESC));
++	vm_wr(VM_DESC_HI, (uint32_t)((ring + RING_DESC) >> 32));
++	vm_wr(VM_AVAIL_LO, (uint32_t)(ring + RING_AVAIL));
++	vm_wr(VM_AVAIL_HI, (uint32_t)((ring + RING_AVAIL) >> 32));
++	vm_wr(VM_USED_LO, (uint32_t)(ring + RING_USED));
++	vm_wr(VM_USED_HI, (uint32_t)((ring + RING_USED) >> 32));
++	vm_wr(VM_QUEUE_READY, 1);
++}
++
++/* One control request (descriptors 0 and 1); returns the response status. */
++static uint32_t
++vsnd_ctl(const void *req, uint32_t req_len, uint32_t resp_len)
++{
++	struct vring_desc *desc = ring_desc(CTLQ);
++	memcpy((void *)(vs.dma + OFF_CTL_REQ), req, req_len);
++	bzero((void *)(vs.dma + OFF_CTL_RESP), resp_len);
++	desc[0] = (struct vring_desc){ vs.dma_pa + OFF_CTL_REQ, req_len, VRING_DESC_F_NEXT, 1 };
++	desc[1] = (struct vring_desc){ vs.dma_pa + OFF_CTL_RESP, resp_len, VRING_DESC_F_WRITE, 0 };
++	ring16(CTLQ, RING_AVAIL)[2 + vs.ctl_avail % QSIZE] = 0;
++	__asm__ volatile("dmb ish" ::: "memory");
++	vs.ctl_avail++;
++	ring16(CTLQ, RING_AVAIL)[1] = vs.ctl_avail;
++	vm_wr(VM_QUEUE_NOTIFY, CTLQ);
++	for (unsigned ms = 0; ring16(CTLQ, RING_USED)[1] == vs.ctl_used; ms++) {
++		if (ms == 1000) {
++			return 0;               /* no answer */
++		}
++		vsnd_wait(1);
++	}
++	vs.ctl_used++;
++	__asm__ volatile("dmb ish" ::: "memory");
++	return *(volatile uint32_t *)(vs.dma + OFF_CTL_RESP);
++}
++
++static int
++vsnd_device_setup(void)
++{
++	vm_wr(VM_STATUS, 0);
++	vm_wr(VM_STATUS, ST_ACK);
++	vm_wr(VM_STATUS, ST_ACK | ST_DRIVER);
++	vm_wr(VM_DEV_FEAT_SEL, 1);
++	if (!(vm_rd(VM_DEV_FEAT) & VIRTIO_F_VERSION_1_HI)) {
++		return ENOTSUP;
++	}
++	vm_wr(VM_DRV_FEAT_SEL, 0);
++	vm_wr(VM_DRV_FEAT, 0);
++	vm_wr(VM_DRV_FEAT_SEL, 1);
++	vm_wr(VM_DRV_FEAT, VIRTIO_F_VERSION_1_HI);
++	vm_wr(VM_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK);
++	if (!(vm_rd(VM_STATUS) & ST_FEATURES_OK)) {
++		return ENOTSUP;
++	}
++	for (unsigned q = CTLQ; q <= TXQ; q += TXQ) {
++		vm_wr(VM_QUEUE_SEL, q);
++		if (vm_rd(VM_QUEUE_READY) || vm_rd(VM_QUEUE_MAX) < QSIZE) {
++			return ENXIO;
++		}
++	}
++	if (kmem_alloc_contig(kernel_map, &vs.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)vs.dma);
++	if (!pn) {
++		return ENOMEM;
++	}
++	vs.dma_pa = ptoa_64(pn);
++	vsnd_queue_setup(CTLQ);
++	vsnd_queue_setup(TXQ);
++	vm_wr(VM_STATUS, ST_ACK | ST_DRIVER | ST_FEATURES_OK | ST_DRIVER_OK);
++
++	uint32_t streams = vm_rd(VM_CONFIG + 4);
++	uint32_t n = MIN(streams, MAX_STREAMS);
++	if (!n) {
++		return ENODEV;
++	}
++	uint32_t query[4] = { SND_R_PCM_INFO, 0, n, sizeof(struct snd_pcm_info) };
++	uint32_t st = vsnd_ctl(query, sizeof(query), 4 + n * sizeof(struct snd_pcm_info));
++	if (st != SND_S_OK) {
++		printf("SWEET VSND: PCM_INFO status 0x%x\n", st);
++		return EIO;
++	}
++	vs.stream = ~0u;
++	for (uint32_t i = 0; i < n; i++) {
++		struct snd_pcm_info info;
++		memcpy(&info, (const void *)(vs.dma + OFF_CTL_RESP + 4 + i * sizeof(info)), sizeof(info));
++		printf("SWEET VSND: stream %u dir %u ch %u-%u formats 0x%llx rates 0x%llx\n", i, info.direction,
++		    info.channels_min, info.channels_max, info.formats, info.rates);
++		if (vs.stream == ~0u && info.direction == SND_D_OUTPUT && info.channels_min <= 2 && info.channels_max >= 2 &&
++		    (info.formats & (1ull << SND_FMT_S16)) && (info.rates & (1ull << SND_RATE_44100))) {
++			vs.stream = i;
++		}
++	}
++	if (vs.stream == ~0u) {
++		return ENODEV;
++	}
++	struct {
++		uint32_t code, stream_id, buffer_bytes, period_bytes, features;
++		uint8_t channels, format, rate, padding;
++	} params = { SND_R_PCM_SET_PARAMS, vs.stream, TX_INFLIGHT * PERIOD_BYTES, PERIOD_BYTES, 0, 2, SND_FMT_S16, SND_RATE_44100, 0 };
++	if ((st = vsnd_ctl(&params, sizeof(params), 4)) != SND_S_OK) {
++		printf("SWEET VSND: SET_PARAMS status 0x%x\n", st);
++		return EIO;
++	}
++	uint32_t pcm[2] = { SND_R_PCM_PREPARE, vs.stream };
++	if ((st = vsnd_ctl(pcm, sizeof(pcm), 4)) != SND_S_OK) {
++		printf("SWEET VSND: PREPARE status 0x%x\n", st);
++		return EIO;
++	}
++	pcm[0] = SND_R_PCM_START;
++	if ((st = vsnd_ctl(pcm, sizeof(pcm), 4)) != SND_S_OK) {
++		printf("SWEET VSND: START status 0x%x\n", st);
++		return EIO;
++	}
++	return 0;
++}
++
++/* Hand whole periods from the ring to the TX queue; reclaim played ones. */
++static void
++vsnd_tx_poll(void)
++{
++	struct vring_desc *desc = ring_desc(TXQ);
++	bool notify = false;
++
++	while (vs.tx_used != ring16(TXQ, RING_USED)[1]) {
++		__asm__ volatile("dmb ish" ::: "memory");
++		volatile uint32_t *elem = (volatile uint32_t *)(vs.dma + OFF_RING(TXQ) + RING_USED + 4 + 8 * (vs.tx_used % QSIZE));
++		uint32_t slot = elem[0] / 3;
++		if (slot < TX_SLOTS) {
++			if (*(volatile uint32_t *)(vs.dma + OFF_TX_HDR(slot) + 4) == SND_S_OK) {
++				vs.played++;
++			} else {
++				vs.errors++;
++			}
++			vs.slot_busy &= ~(1u << slot);
++		}
++		vs.tx_used++;
++	}
++	if (vm_rd(VM_INT_STATUS)) {
++		vm_wr(VM_INT_ACK, vm_rd(VM_INT_STATUS));
++	}
++	for (;;) {
++		if (__builtin_popcount(vs.slot_busy) >= TX_INFLIGHT) {
++			break;
++		}
++		lck_mtx_lock(vs.lock);
++		if (vs.len < PERIOD_BYTES) {
++			lck_mtx_unlock(vs.lock);
++			break;
++		}
++		uint32_t slot = __builtin_ctz(~vs.slot_busy);
++		uint8_t *data = (uint8_t *)(vs.dma + OFF_TX_DATA(slot));
++		uint32_t first = MIN(PERIOD_BYTES, RING_BYTES - vs.head);
++		memcpy(data, vs.ring + vs.head, first);
++		memcpy(data + first, vs.ring, PERIOD_BYTES - first);
++		vs.head = (vs.head + PERIOD_BYTES) % RING_BYTES;
++		vs.len -= PERIOD_BYTES;
++		lck_mtx_unlock(vs.lock);
++
++		uint64_t hdr = vs.dma_pa + OFF_TX_HDR(slot);
++		*(volatile uint32_t *)(vs.dma + OFF_TX_HDR(slot)) = vs.stream;
++		*(volatile uint32_t *)(vs.dma + OFF_TX_HDR(slot) + 4) = 0;
++		desc[3 * slot] = (struct vring_desc){ hdr, 4, VRING_DESC_F_NEXT, (uint16_t)(3 * slot + 1) };
++		desc[3 * slot + 1] = (struct vring_desc){ vs.dma_pa + OFF_TX_DATA(slot), PERIOD_BYTES, VRING_DESC_F_NEXT,
++		    (uint16_t)(3 * slot + 2) };
++		desc[3 * slot + 2] = (struct vring_desc){ hdr + 4, 8, VRING_DESC_F_WRITE, 0 };
++		vs.slot_busy |= 1u << slot;
++		ring16(TXQ, RING_AVAIL)[2 + vs.tx_avail % QSIZE] = (uint16_t)(3 * slot);
++		__asm__ volatile("dmb ish" ::: "memory");
++		vs.tx_avail++;
++		ring16(TXQ, RING_AVAIL)[1] = vs.tx_avail;
++		notify = true;
++	}
++	if (notify) {
++		vm_wr(VM_QUEUE_NOTIFY, TXQ);
++	}
++}
++
++static int
++vsnd_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	return vs.ready ? 0 : ENXIO;
++}
++
++static int
++vsnd_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	return 0;
++}
++
++/* Never blocks: what does not fit in the ring is dropped (whole frames). */
++static int
++vsnd_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uint8_t buf[1024];
++	while (uio_resid(uio) > 0) {
++		uint32_t n = (uint32_t)MIN(uio_resid(uio), (user_ssize_t)sizeof(buf));
++		int err = uiomove((caddr_t)buf, (int)n, uio);
++		if (err) {
++			return err;
++		}
++		lck_mtx_lock(vs.lock);
++		uint32_t take = MIN(n, RING_BYTES - vs.len) & ~(FRAME_BYTES - 1);
++		uint32_t tail = (vs.head + vs.len) % RING_BYTES;
++		uint32_t first = MIN(take, RING_BYTES - tail);
++		memcpy(vs.ring + tail, buf, first);
++		memcpy(vs.ring, buf + first, take - first);
++		vs.len += take;
++		vs.written += take;
++		vs.dropped += n - take;
++		lck_mtx_unlock(vs.lock);
++	}
++	return 0;
++}
++
++static const struct cdevsw vsnd_cdevsw = {
++	.d_open       = vsnd_open,
++	.d_close      = vsnd_close,
++	.d_read       = eno_rdwrt,
++	.d_write      = vsnd_write,
++	.d_ioctl      = eno_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++static void
++vsnd_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	vm_offset_t base = ml_io_map(VMMIO_PA, VMMIO_SLOTS * VMMIO_STRIDE);
++	unsigned slot;
++	for (slot = 0; slot < VMMIO_SLOTS; slot++) {
++		vs.regs = base + slot * VMMIO_STRIDE;
++		if (vm_rd(VM_MAGIC) == 0x74726976 && vm_rd(VM_DEVICE_ID) == VIRTIO_ID_SOUND) {
++			break;
++		}
++	}
++	int err = slot == VMMIO_SLOTS ? ENODEV : vm_rd(VM_VERSION) != 2 ? ENOTSUP : vsnd_device_setup();
++	int major = -1;
++	if (!err) {
++		vs.ring = kalloc_data(RING_BYTES, Z_WAITOK | Z_ZERO);
++		major = vs.ring ? cdevsw_add(-1, &vsnd_cdevsw) : -1;
++		if (major < 0) {
++			err = ENOMEM;
++		}
++	}
++	printf("SWEET VSND: slot %u -> %d, stream %u, S16 stereo 44100 Hz, /dev/qemuaudio\n", slot, err, vs.stream);
++	if (err) {
++		(void)thread_terminate(current_thread());
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	vs.ready = true;
++	devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "qemuaudio");
++	uint64_t reported = 0;
++	unsigned idle = 0;
++	for (;;) {
++		vsnd_tx_poll();
++		/* one line per sound: when playback has been idle for a second */
++		if (vs.played != reported && !vs.slot_busy && ++idle >= 500) {
++			printf("SWEET VSND: %llu periods played, %llu errors, %llu bytes written, %llu dropped\n",
++			    vs.played, vs.errors, vs.written, vs.dropped);
++			reported = vs.played;
++		}
++		if (vs.slot_busy) {
++			idle = 0;
++		}
++		vsnd_wait(2);
++	}
++}
++
++void
++sweet_vsnd_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	if (vs.started) {
++		return;
++	}
++	vs.started = true;
++	(void)PE_parse_boot_argn("sweetvsnd", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++	vs.lock = lck_mtx_alloc_init(lck_grp_alloc_init("sweet_vsnd", LCK_GRP_ATTR_NULL), LCK_ATTR_NULL);
++	if (kernel_thread_start(vsnd_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

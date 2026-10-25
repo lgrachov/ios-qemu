@@ -1,0 +1,55 @@
+diff --git a/bsd/net/bpf.c b/bsd/net/bpf.c
+index 719b8f218d802069614bef6cbdaab1ab0b633fc2..ba07a2979c4e3e6dc74d7714ce21a229f1eba54b 100644
+--- a/bsd/net/bpf.c
++++ b/bsd/net/bpf.c
+@@ -1594,8 +1594,35 @@ bpf_timed_out(void *arg, __unused void *dummy)
+ /* keep in sync with bpf_movein above: */
+ #define MAX_DATALINK_HDR_LEN    (sizeof(struct firewire_header))
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* QEMU en0 bring-up: DHCP (IPConfiguration) transmits with bpf_write. */
++static int sweet_bpf_logged;
++static int bpfwrite_sweet_inner(dev_t dev, struct uio *uio, int ioflag);
++
++int
++bpfwrite(dev_t dev, struct uio *uio, int ioflag)
++{
++	user_ssize_t resid = uio_resid(uio);
++	int error = bpfwrite_sweet_inner(dev, uio, ioflag);
++	if (error != 0 && sweet_bpf_logged < 32) {
++		struct bpf_d *d = bpf_dtab[minor(dev)];
++		ifnet_t ifp = (d != NULL && d != BPF_DEV_RESERVED && d->bd_bif != NULL) ? d->bd_bif->bif_ifp : NULL;
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		sweet_bpf_logged++;
++		printf("SWEET BPF: %s write %lld bytes on %s%d -> %d (if_flags 0x%x)\n", name,
++		    (long long)resid, ifp ? ifp->if_name : "-", ifp ? ifp->if_unit : 0, error,
++		    ifp ? ifp->if_flags : 0);
++	}
++	return error;
++}
++
++static int
++bpfwrite_sweet_inner(dev_t dev, struct uio *uio, __unused int ioflag)
++#else
+ int
+ bpfwrite(dev_t dev, struct uio *uio, __unused int ioflag)
++#endif
+ {
+ 	struct bpf_d *d;
+ 	struct ifnet *ifp;
+@@ -2277,6 +2304,14 @@ bpfioctl(dev_t dev, u_long cmd, caddr_t __sized_by(IOCPARM_LEN(cmd)) addr,
+ 		} else {
+ 			error = bpf_setif(d, ifp, true, false, false);
+ 		}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (sweet_bpf_logged < 32) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			sweet_bpf_logged++;
++			printf("SWEET BPF: %s BIOCSETIF %s -> %d\n", name, ifr.ifr_name, error);
++		}
++#endif
+ 		break;
+ 	}
+ 

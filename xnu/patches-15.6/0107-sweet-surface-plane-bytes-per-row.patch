@@ -1,0 +1,15 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 39908153936877887d95c9e86f7ed955fb6ae4ce..244012dd3c7be1f51b4ff90da6de28bb207557b5 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -718,6 +718,10 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 		put32(p, 0x04, pl->height);
+ 		put32(p, 0x08, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
++		/* IOSurfaceClientGetBytesPerRowOfPlane reads +0x10 (+0x08 is not
++		   it): without this every plane of a multi-plane surface reported 0
++		   bytes per row and video decoders wrote 4 GiB past their buffer */
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;

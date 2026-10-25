@@ -1,0 +1,104 @@
+diff --git a/iokit/Kernel/arm/SweetNetworkStack.cpp b/iokit/Kernel/arm/SweetNetworkStack.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c234067d29acb3ec786efeb35bf9bb12e4aaa096
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetNetworkStack.cpp
+@@ -0,0 +1,70 @@
++/*
++ * Built-in IONetworkStack for SWEET.
++ *
++ * configd's InterfaceNamer (Plugins/InterfaceNamer/ifnamer.c) opens the
++ * IONetworkStack service (IONetworkingFamily, which SWEET does not have) to
++ * name network interfaces. Without it, quietCallback() returns early with
++ * "No network stack object" and InterfaceNamer never reports IOKit quiet;
++ * only its 300 s stack timeout lets SystemConfiguration go on, and every
++ * SCNetworkInterface caller (Settings > General > About, Date & Time) waits
++ * that long. SWEET's network interfaces (bsd/dev/sweet_usb.c) are plain
++ * ifnets with no IONetworkInterface objects, so there is never anything to
++ * name: the stack only has to exist and accept naming commands.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <sys/proc.h>
++
++class IONetworkStack : public IOService {
++	OSDeclareDefaultStructors(IONetworkStack);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IONetworkStack, IOService);
++
++bool
++IONetworkStack::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "IONetworkStackUserClient");
++	registerService();
++	IOLog("SWEET NETSTACK: IONetworkStack registered (no interfaces to name)\n");
++	return true;
++}
++
++class IONetworkStackUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(IONetworkStackUserClient);
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
++
++IOReturn
++IONetworkStackUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++/* Naming commands (IOConnectSetCFProperties); only sent for IONetworkInterfaces. */
++IOReturn
++IONetworkStackUserClient::setProperties(__unused OSObject *properties)
++{
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET NETSTACK: %s naming command ignored\n", name);
++	return kIOReturnSuccess;
++}
++#endif /* SWEET */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index c4fdd55eca6537711de569bc2e079a151b484757..8a739eae1cc234023e560b0d718d27c6d6b6b67f 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -58,6 +58,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = IOWatchdog;"
+     "   },"
+     "   {"
++    "     'IOClass'         = IONetworkStack;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = IONetworkStack;"
++    "   },"
++    "   {"
+     "     'IOClass'         = IOCoreSurfaceRoot;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOCoreSurfaceRoot;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 157b8812801733a2fe0df98d4847a2a3bfe3b050..b06174f858c6c6a745dad160464a651e24abb629 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetNetworkStack.cpp                           optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp

@@ -1,0 +1,17 @@
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index 95553a027b490c4a6904c948809b3a5e74da1452..52483c899c681ce537ba9a8be8c190904e588a8e 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -77,8 +77,12 @@ IOKitInitializeTime( void )
+ 	t.tv_sec = 30;
+ 	t.tv_nsec = 0;
+ 
++// SWEET: no IORTC driver either (the PMIC RTC is not driven); waiting only
++// cost 30 s per boot before clock_initialize_calendar starts from 0 anyway.
++#if !defined(ARM64_BOARD_CONFIG_SWEET)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
++#endif
+ #if defined(__i386__) || defined(__x86_64__)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IONVRAM"), &t );

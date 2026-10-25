@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       macos_version:
-        description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16 era)
+        description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16; 15.6 = xnu-11417, iOS 18, patches in xnu/patches-15.6)
         default: "13.5"
       kernel_config:
         description: RELEASE / DEVELOPMENT / DEBUG
@@ -19,6 +19,7 @@ on:
     branches: [main]
     paths:
       - "xnu/patches/**"
+      - "xnu/patches-15.6/**"
       - ".github/workflows/xnu.yml"
 
 concurrency:
@@ -46,8 +47,14 @@ jobs:
           git init -q dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
-          # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
-          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          # dxb reads 12.5-14.3 patches from patches/ and 14.6-15.6 from
+          # patches/15.0/; ours go next to blacktop's. xnu/patches is the
+          # xnu-8796 (iOS 16) set, xnu/patches-15.6 the xnu-11417 (iOS 18) one.
+          case "$MACOS_VERSION" in
+          13.5) cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/ ;;
+          15.6) cp xnu/patches-15.6/*.patch xnu/patches-15.6/*.sh dxb/patches/15.0/ ;;
+          *) echo "no SWEET patch set for macOS $MACOS_VERSION" >&2; exit 1 ;;
+          esac
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
@@ -61,7 +68,13 @@ jobs:
           sudo chmod +x /usr/local/bin/xcodes
           sw_vers
           ls -d /Applications/Xcode*.app
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          # 13.5: the oldest Xcode (15.x iig, see runs-on); 15.6: the newest
+          # (xnu-11417's IORPC needs Xcode 16's iig)
+          if [ "$MACOS_VERSION" = 13.5 ]; then
+            XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          else
+            XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          fi
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"
           xcodebuild -version
@@ -72,7 +85,14 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee ../build.log
+          # dxb only warns when a patch does not apply; ours must all apply
+          if grep -E 'Skipping patch .*/[0-9]{4}-[^/]*\.patch' ../build.log; then
+            echo "::error::a SWEET patch did not apply (see above)"
+            exit 1
+          fi
 
       - name: Package build tree for local compiles
         if: always()

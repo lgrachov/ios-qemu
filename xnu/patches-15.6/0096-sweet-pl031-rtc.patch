@@ -1,0 +1,102 @@
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index 52483c899c681ce537ba9a8be8c190904e588a8e..4d359cf4ab024e25f888f4e75c60c1bb96648176 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -77,12 +77,10 @@ IOKitInitializeTime( void )
+ 	t.tv_sec = 30;
+ 	t.tv_nsec = 0;
+ 
+-// SWEET: no IORTC driver either (the PMIC RTC is not driven); waiting only
+-// cost 30 s per boot before clock_initialize_calendar starts from 0 anyway.
+-#if !defined(ARM64_BOARD_CONFIG_SWEET)
++// SWEET: SweetPlatformExpert publishes IORTC once gIOPlatform can answer
++// (PL031 in QEMU, 0 on the phone), so the stock wait is short.
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
+-#endif
+ #if defined(__i386__) || defined(__x86_64__)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IONVRAM"), &t );
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 20543a96ccb9089d9b63dc0bfd16c79f22f4d53f..32dea90202324ded82ec1b4315efcaafea423a07 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -10,6 +10,19 @@
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
++#include <pexpert/device_tree.h>
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++/*
++ * Calendar clock: an ARM PL031 at /sweet-rtc (mkadt.py --qemu: QEMU virt's,
++ * which counts host UTC seconds). Absent on the phone (its PMIC RTC is not
++ * driven): the calendar then starts at 0 as before.
++ */
++#define PL031_DR        0x000   /* data: seconds */
++#define PL031_LR        0x008   /* load */
++#define PL031_PERIPHID0 0xfe0   /* 0x31 */
++static volatile uint32_t *sweet_rtc;
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -19,6 +32,8 @@ public:
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	void getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs) APPLE_KEXT_OVERRIDE;
++	void setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+@@ -26,15 +41,49 @@ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++
+ 	IOLog("SWEET: starting device-tree platform expert\n");
++	if (SecureDTLookupEntry(NULL, "/sweet-rtc", &node) == kSuccess &&
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) == kSuccess &&
++	    size >= 2 * sizeof(uintptr_t)) {
++		volatile uint32_t *rtc = (volatile uint32_t *)ml_io_map(reg[0], reg[1]);
++		if ((rtc[PL031_PERIPHID0 / 4] & 0xff) == 0x31) {
++			sweet_rtc = rtc;
++		}
++		IOLog("SWEET RTC: PL031 at 0x%lx: %s, %u s\n", (unsigned long)reg[0],
++		    sweet_rtc ? "ok" : "bad id", sweet_rtc ? sweet_rtc[PL031_DR / 4] : 0);
++	}
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
+ 	registerService();
++	/*
++	 * IOKitInitializeTime() waits up to 30 s for this before reading the
++	 * calendar through gIOPlatform (getUTCTimeOfDay below), RTC or not.
++	 */
++	publishResource("IORTC");
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
+ }
+ 
++void
++SweetPlatformExpert::getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs)
++{
++	*secs = sweet_rtc ? sweet_rtc[PL031_DR / 4] : 0;
++	*nsecs = 0;
++}
++
++void
++SweetPlatformExpert::setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs __unused)
++{
++	if (sweet_rtc) {
++		sweet_rtc[PL031_LR / 4] = (uint32_t)secs;
++	}
++}
++
+ const char *
+ SweetPlatformExpert::deleteList(void)
+ {

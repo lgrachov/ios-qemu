@@ -1,0 +1,51 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 82eea021a6a147d9f26f329e6e48b1a017f2ec64..dfeec5ec13554f98c9584a8949e1426cf734b53c 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -305,8 +305,37 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	}
+ }
+ 
++/*
++ * Policy "AMFI": AppleMobileFileIntegrity registers a MAC policy named "AMFI"
++ * and answers __mac_syscall("AMFI", call, arg). SWEET replaced the kext, so
++ * with no policy of that name __mac_syscall returns ENOPOLICY ("Policy not
++ * found"). The one call reached on SWEET is amfi_interface_query_bootarg_state
++ * (call 0x60), which writes a uint64 boot-arg-state bitmask to arg: libmis /
++ * AppleMobileFileIntegrity and ExtensionFoundation use it to learn whether
++ * code-signing enforcement is off. ExtensionFoundation reads (state & 0x86)
++ * as "code signing enforcement disabled" and only then skips enforcing its
++ * XPC extension-point cache signature; when the query errors it instead fails
++ * with "Unable to find AMFI" (com.apple.extensionKit Code=12) and the cache is
++ * unreadable. SWEET's signature policy already permits everything, so this
++ * reports enforcement disabled (0x86) to match reality. Every other call keeps
++ * returning ENOPOLICY, so nothing but this query changes.
++ */
++#define SWEET_AMFI_QUERY_BOOTARG_STATE          0x60
++#define SWEET_AMFI_BOOTARG_ENFORCEMENT_OFF      0x86ULL
++
++static int
++sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	if (call == SWEET_AMFI_QUERY_BOOTARG_STATE) {
++		uint64_t state = SWEET_AMFI_BOOTARG_ENFORCEMENT_OFF;
++		return copyout(&state, arg, sizeof(state));
++	}
++	return ENOPOLICY;
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_policy_syscall = sweet_amfi_syscall,
+ };
+ 
+ /*
+@@ -391,7 +420,7 @@ static struct mac_policy_conf sweet_sandbox_mac_conf = {
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+-	.mpc_name = "SWEET AMFI",
++	.mpc_name = "AMFI",
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+ 	.mpc_ops = &sweet_amfi_mac_ops,
+ };
