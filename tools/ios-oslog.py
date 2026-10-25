@@ -2,6 +2,7 @@
 """Read the iOS guest's unified log (os_log) without Apple's `log` tool.
 
   ios-oslog.py DIR [--proc NAME[,NAME]] [--grep TEXT] [--files N] [--stats]
+               [--cache CACHEDIR] [--root ROOT ...]
 
 DIR holds `diagnostics/` and `uuidtext/` copied from the guest's
 /private/var/db (mount the disk image with -o rdonly,noowners). macOS `log show`
@@ -9,7 +10,12 @@ opens a hand-built .logarchive of these but decodes nothing (missing archive
 metadata), so this walks the tracev3 files itself.
 
 tracev3: a sequence of chunks (u32 tag, u32 subtag, u64 size, data, 8-byte
-aligned). 0x1000 header, 0x600b catalog (UUIDs, subsystem strings, processes),
+aligned). When logd wrote no uuidtext (seen on the iOS 18 disk), --cache
+(the folder with dyld_shared_cache_arm64e*) and --root (mounted guest or IPSW
+roots, repeatable) give the format strings and process names from the
+shared cache and the binaries themselves (index cached in DIR/binindex.json).
+
+0x1000 header, 0x600b catalog (UUIDs, subsystem strings, processes),
 0x600d chunkset = LZ4 block ('bv41') holding 0x6001 firehose chunks (log
 entries), 0x6002 oversize, 0x6003 statedump, 0x6004 simpledump.
 """
@@ -84,9 +90,10 @@ TIMEBASE = 24000000	# hvf: the host's 24 MHz counter (mkadt.py --hvf)
 class Strings:
     """Format strings: uuidtext/XX/YYYY.. per binary, uuidtext/dsc/UUID per shared cache."""
 
-    def __init__(self, root):
+    def __init__(self, root, macho=None, cache=None):
         self.root = os.path.join(root, 'uuidtext')
         self.bins, self.dscs = {}, {}
+        self.macho, self.cache = macho, cache
 
     def binary(self, uuid):
         if uuid not in self.bins:
@@ -106,7 +113,9 @@ class Strings:
 
     def binary_path(self, uuid):
         ent = self.binary(uuid)
-        return ent[2] if ent else None
+        if ent:
+            return ent[2]
+        return self.macho.path(uuid) if self.macho else None
 
     def dsc(self, uuid):
         if uuid not in self.dscs:
@@ -136,7 +145,8 @@ class Strings:
             for start, size, data_off in ent[1]:
                 if start <= off < start + size:
                     return self.cstr(ent[0], data_off + off - start)
-        return None
+            return None
+        return self.macho.string(uuid, off) if self.macho else None
 
     def from_dsc(self, uuid, off):
         ent = self.dsc(uuid)
@@ -147,6 +157,122 @@ class Strings:
                 text, data_off, size, img = ranges[i]
                 if off < text + size:
                     return self.cstr(d, data_off + off - text)
+            return None
+        return self.cache.string(off) if self.cache else None
+
+
+class MachO:
+    """Format strings straight from binaries: UUID -> (path, segments)."""
+
+    def __init__(self, roots, cache_file):
+        self.index, self.files = {}, {}
+        key = sorted(os.path.abspath(r) for r in roots)
+        if cache_file and os.path.exists(cache_file):
+            c = __import__('json').load(open(cache_file))
+            if c.get('roots') == key:
+                self.index = c['index']
+        if roots and not self.index:
+            for r in roots:
+                for dp, dns, fns in os.walk(r):
+                    for fn in fns:
+                        path = os.path.join(dp, fn)
+                        for u, segs in self.scan(path):
+                            self.index.setdefault(u, ('/' + os.path.relpath(path, r), path, segs))
+            if cache_file:
+                __import__('json').dump({'roots': key, 'index': self.index}, open(cache_file, 'w'))
+
+    @staticmethod
+    def scan(path):
+        """(UUID, [(vmaddr, vmsize, fileoff), ...]) for each arm64 slice of a Mach-O file."""
+        try:
+            if os.path.islink(path) or not os.path.isfile(path):
+                return []
+            with open(path, 'rb') as f:
+                head = f.read(4096)
+                if head[:4] in (b'\xca\xfe\xba\xbe',):
+                    n = struct.unpack_from('>I', head, 4)[0]
+                    slices = [struct.unpack_from('>IIII', head, 8 + 20 * i) for i in range(min(n, 8))]
+                    out = []
+                    for cpu, sub, off, size in slices:
+                        if cpu == 0x0100000c:
+                            f.seek(off)
+                            out += MachO.thin(f.read(65536), off)
+                    return out
+                if head[:4] == b'\xcf\xfa\xed\xfe':
+                    f.seek(0)
+                    return MachO.thin(f.read(65536), 0)
+        except OSError:
+            pass
+        return []
+
+    @staticmethod
+    def thin(d, base):
+        if len(d) < 32 or d[:4] != b'\xcf\xfa\xed\xfe' or struct.unpack_from('<I', d, 4)[0] != 0x0100000c:
+            return []
+        ncmds = struct.unpack_from('<I', d, 16)[0]
+        o, uuid, segs = 32, None, []
+        for _ in range(ncmds):
+            if o + 8 > len(d):
+                break
+            cmd, size = struct.unpack_from('<II', d, o)
+            if cmd == 0x1b:
+                uuid = d[o + 8:o + 24].hex().upper()
+            elif cmd == 0x19:
+                vmaddr, vmsize, fileoff = struct.unpack_from('<QQQ', d, o + 24)
+                segs.append((vmaddr, vmsize, base + fileoff))
+            o += size or 8
+        return [(uuid, segs)] if uuid else []
+
+    def path(self, uuid):
+        e = self.index.get(uuid)
+        return e[0] if e else None
+
+    def string(self, uuid, off):
+        e = self.index.get(uuid)
+        if not e:
+            return None
+        _, path, segs = e
+        start = min(s[0] for s in segs if s[1])	# __TEXT (lowest mapped segment)
+        vm = start + off
+        for vmaddr, vmsize, fileoff in segs:
+            if vmaddr <= vm < vmaddr + vmsize:
+                if path not in self.files:
+                    self.files[path] = open(path, 'rb')
+                f = self.files[path]
+                f.seek(fileoff + vm - vmaddr)
+                b = f.read(4096)
+                return b.split(b'\0')[0].decode('utf-8', 'replace')
+        return None
+
+
+class SharedCache:
+    """Format strings straight from a dyld shared cache (main file + subcaches)."""
+
+    def __init__(self, folder):
+        self.maps, self.base = [], None
+        for path in sorted(glob.glob(os.path.join(folder, 'dyld_shared_cache_arm64e*'))):
+            if path.endswith(('.map', '.symbols', '.a2s')):
+                continue
+            d = open(path, 'rb').read(4096)
+            if not d.startswith(b'dyld_v1'):		# e.g. .atlas
+                continue
+            moff, mcount = struct.unpack_from('<II', d, 0x10)
+            for i in range(mcount):
+                addr, size, foff = struct.unpack_from('<QQQ', d, moff + 32 * i)
+                self.maps.append((addr, size, foff, path))
+                if self.base is None or addr < self.base:
+                    self.base = addr
+        self.files = {}
+
+    def string(self, off):
+        vm = self.base + off
+        for addr, size, foff, path in self.maps:
+            if addr <= vm < addr + size:
+                if path not in self.files:
+                    self.files[path] = open(path, 'rb')
+                f = self.files[path]
+                f.seek(foff + vm - addr)
+                return f.read(4096).split(b'\0')[0].decode('utf-8', 'replace')
         return None
 
 
@@ -321,13 +447,17 @@ def main():
     ap.add_argument('--proc', help='comma separated process names (executable basename)')
     ap.add_argument('--grep', help='only messages containing TEXT')
     ap.add_argument('--stats', action='store_true', help='chunk counts per file')
+    ap.add_argument('--cache', help='folder with the dyld_shared_cache_arm64e* files (when uuidtext/dsc is missing)')
+    ap.add_argument('--root', action='append', default=[],
+                    help='mounted root with the binaries (when uuidtext is missing); repeatable')
     a = ap.parse_args()
     files = []
     for sub in ('Persist', 'Special', 'Signpost', 'HighVolume'):
         fs = sorted(glob.glob(os.path.join(a.dir, 'diagnostics', sub, '*.tracev3')))
         files += fs[-a.files:] if a.files else fs
     procs = set(a.proc.split(',')) if a.proc else None
-    strings = Strings(a.dir)
+    macho = MachO(a.root, os.path.join(a.dir, 'binindex.json')) if a.root else None
+    strings = Strings(a.dir, macho, SharedCache(a.cache) if a.cache else None)
     rows = []
     for f in files:
         if a.stats:

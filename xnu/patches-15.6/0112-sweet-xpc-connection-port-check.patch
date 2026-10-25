@@ -1,0 +1,29 @@
+diff --git a/osfmk/ipc/mach_port.c b/osfmk/ipc/mach_port.c
+index 2583f81915290b357cc5bc0159f07044c42884b6..fff3432f4bb2e6de9e11aeab8d4b9728abe56fa5 100644
+--- a/osfmk/ipc/mach_port.c
++++ b/osfmk/ipc/mach_port.c
+@@ -2942,9 +2942,24 @@ mach_port_is_connection_for_service(
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET has no Sandbox kext, so no message filter callbacks are ever
++	 * registered and no port carries a sandbox label: answer as for an
++	 * unlabeled service port ("nothing to check", below) instead of
++	 * KERN_NOT_SUPPORTED. iOS 18's libxpc otherwise drops every listener
++	 * check-in ("Failed to verify check-in connection port was derived from
++	 * the listener connection port", "Bogus check-in attempt").
++	 */
++	if (!mach_msg_filter_at_least(MACH_MSG_FILTER_CALLBACKS_VERSION_1) &&
++	    mach_msg_filter_callbacks.fetch_filter_policy != NULL) {
++		return KERN_NOT_SUPPORTED;
++	}
++#else
+ 	if (!mach_msg_filter_at_least(MACH_MSG_FILTER_CALLBACKS_VERSION_1)) {
+ 		return KERN_NOT_SUPPORTED;
+ 	}
++#endif
+ 
+ 	ret = ipc_port_translate_receive(space, service_port_name, &service_port);
+ 	if (ret) {
