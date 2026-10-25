@@ -1,8 +1,8 @@
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 34a3c4af8b9393c2a8d86be9178c32a9ebfe0dd8..3d58e212c40251991388c919c02913830da38949 100644
+index 34a3c4af8b9393c2a8d86be9178c32a9ebfe0dd8..816c1666dcbfe3269e28a3ff4c030ade852eeff5 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -5928,6 +5928,50 @@ bad:
+@@ -5928,6 +5928,56 @@ bad:
   *		to arrays of user space pointers.
   */
  __attribute__((noinline))
@@ -13,7 +13,7 @@ index 34a3c4af8b9393c2a8d86be9178c32a9ebfe0dd8..3d58e212c40251991388c919c0291383
 + * them to their CPU fallbacks; every exec gets it through dyld's
 + * DYLD_INSERT_LIBRARIES (AMFI's dyld policy allows DYLD_* variables and
 + * failed insertions, see sweet_amfi.c, so a missing dylib changes nothing).
-+ * Not for launchd, nor when the caller already sets the variable.
++ * Not for /sbin/launchd, nor when the caller already sets the variable.
 + * Boot-arg sweetcpushim=0 turns it off.
 + */
 +#define SWEET_CPU_SHIM_ENV "DYLD_INSERT_LIBRARIES=/usr/lib/qemu/libQEMUCPU.dylib"
@@ -28,7 +28,8 @@ index 34a3c4af8b9393c2a8d86be9178c32a9ebfe0dd8..3d58e212c40251991388c919c0291383
 +		PE_parse_boot_argn("sweetcpushim", &on, sizeof(on));
 +		sweet_cpu_shim = on;
 +	}
-+	if (!sweet_cpu_shim || proc_getpid(current_proc()) == 1) {
++	/* not current_proc(): under posix_spawn that is the parent (launchd) */
++	if (!sweet_cpu_shim || strcmp(imgp->ip_strings + strlen(EXECUTABLE_KEY), "/sbin/launchd") == 0) {
 +		return 0;
 +	}
 +	static const char key[] = "DYLD_INSERT_LIBRARIES=";
@@ -46,6 +47,11 @@ index 34a3c4af8b9393c2a8d86be9178c32a9ebfe0dd8..3d58e212c40251991388c919c0291383
 +	}
 +	imgp->ip_argspace -= ptr_size;
 +	imgp->ip_envc++;
++	static int logged;
++	if (logged < 16) {
++		logged++;
++		printf("SWEET cpushim: %s gets libQEMUCPU\n", imgp->ip_strings + strlen(EXECUTABLE_KEY));
++	}
 +	return 0;
 +}
 +#endif
@@ -53,7 +59,7 @@ index 34a3c4af8b9393c2a8d86be9178c32a9ebfe0dd8..3d58e212c40251991388c919c0291383
  static int
  exec_extract_strings(struct image_params *imgp)
  {
-@@ -6100,6 +6144,13 @@ exec_extract_strings(struct image_params *imgp)
+@@ -6100,6 +6150,13 @@ exec_extract_strings(struct image_params *imgp)
  		imgp->ip_envc++;
  	}
  
@@ -68,7 +74,7 @@ index 34a3c4af8b9393c2a8d86be9178c32a9ebfe0dd8..3d58e212c40251991388c919c0291383
  	if (imgp->ip_argspace < new_ptr_size) {
  		error = E2BIG;
 diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
-index 941d0667e06c270a5f2cc6852c5e6c02ea1534fe..86fbcb32ed70870d24a1538b38d1278db5fe7a97 100644
+index 941d0667e06c270a5f2cc6852c5e6c02ea1534fe..c596d9ed01b43a03e0619c3c1c7002961c6010f2 100644
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
 @@ -497,20 +497,24 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
@@ -105,11 +111,16 @@ index 941d0667e06c270a5f2cc6852c5e6c02ea1534fe..86fbcb32ed70870d24a1538b38d1278d
  
  static int
  sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
-@@ -528,7 +532,9 @@ sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
+@@ -528,7 +532,14 @@ sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
  		if (error) {
  			return error;
  		}
 -		uint64_t policy = SWEET_AMFI_DYLD_ALLOW_AT_PATH | SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS;
++		static int logged;
++		if (logged < 16) {
++			logged++;
++			printf("SWEET AMFI: dyld policy query from %s (input %#llx)\n", proc_best_name(current_proc()), args.input);
++		}
 +		uint64_t policy = SWEET_AMFI_DYLD_ALLOW_AT_PATH | SWEET_AMFI_DYLD_ALLOW_ENV_PATH |
 +		    SWEET_AMFI_DYLD_ALLOW_SHARED_CACHE_ENV | SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS |
 +		    SWEET_AMFI_DYLD_ALLOW_INSERT_FAILURES;
