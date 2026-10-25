@@ -349,7 +349,7 @@ struct tap {
 /*
  * QEMUAUDIO_VSND: the tapped mix goes to the kernel's virtio-sound driver
  * (patch 0108, boot-arg sweetvsnd=1): /dev/qemuaudio takes S16 stereo at
- * 44100 Hz and never blocks (the kernel drops what does not fit), so the
+ * 44100 Hz (other mix rates are resampled) and never blocks (the kernel drops what does not fit), so the
  * write is safe on VirtualAudio's IO thread. Without the device (harness
  * --no-audio, kernel before 0108) open fails and is retried every ~2 s.
  */
@@ -358,22 +358,42 @@ struct tap {
 #define VSND_RATE	44100.0
 #define VSND_FRAMES	1024		/* frames per write */
 
+/*
+ * Other mix rates (iOS 18's VirtualAudio runs at 48000 Hz) are resampled to
+ * VSND_RATE linearly; the phase and the last input frame carry over between
+ * IO cycles, so there are no clicks at buffer boundaries.
+ */
+static float tap_sample(const AudioBuffer *b, UInt32 idx, Boolean is_float, UInt32 bits)
+{
+	if (!b->mData || (idx + 1) * (bits / 8) > b->mDataByteSize)
+		return 0;
+	return is_float ? ((const Float32 *)b->mData)[idx]
+	       : bits == 16 ? ((const SInt16 *)b->mData)[idx] / 32768.0f
+	       : ((const SInt32 *)b->mData)[idx] / 2147483648.0f;
+}
+
+static SInt16 pcm16(float v)
+{
+	return v >= 1.0f ? 32767 : v <= -1.0f ? -32768 : (SInt16)lrintf(v * 32767.0f);
+}
+
 static void tap_play(struct tap *t, const AudioBufferList *out, UInt32 frames, Boolean is_float, UInt32 bits)
 {
 #if QEMUAUDIO_VSND
 	static int fd = -1;
 	static UInt64 next_open;
-	static Boolean warned;
-	if (t->fmt.mSampleRate && t->fmt.mSampleRate != VSND_RATE) {
-		if (!warned)
-			qlog("vsnd: %.0f Hz output, only %.0f Hz is played", t->fmt.mSampleRate, VSND_RATE);
-		warned = true;
-		return;
+	static Boolean logged_rate;
+	static double phase;		/* position of the next output frame, in input frames after prev */
+	static float prev[2];		/* last input frame of the previous call */
+	double rate = t->fmt.mSampleRate ? t->fmt.mSampleRate : VSND_RATE, ratio = rate / VSND_RATE;
+	if (rate != VSND_RATE && !logged_rate) {
+		qlog("vsnd: %.0f Hz output, resampled to %.0f Hz", rate, VSND_RATE);
+		logged_rate = true;
 	}
 	if (fd < 0) {
 		if (t->frames < next_open)
 			return;
-		next_open = t->frames + 2 * (UInt64)VSND_RATE;
+		next_open = t->frames + 2 * (UInt64)rate;
 		fd = open(VSND_PATH, O_WRONLY | O_NONBLOCK);
 		qlog("vsnd: open %s -> %d", VSND_PATH, fd);
 		if (fd < 0)
@@ -386,28 +406,37 @@ static void tap_play(struct tap *t, const AudioBufferList *out, UInt32 frames, B
 	if (r != l)
 		step = 1;
 	SInt16 pcm[VSND_FRAMES * 2];
-	for (UInt32 done = 0; done < frames;) {
-		UInt32 n = frames - done < VSND_FRAMES ? frames - done : VSND_FRAMES;
-		for (UInt32 i = 0; i < 2 * n; i++) {
-			const AudioBuffer *b = i & 1 ? r : l;
-			UInt32 idx = (done + i / 2) * step + (i & 1 ? roff : 0);
-			if (!b->mData || (idx + 1) * (bits / 8) > b->mDataByteSize) {
-				pcm[i] = 0;
-				continue;
-			}
-			float v = is_float ? ((const Float32 *)b->mData)[idx]
-			        : bits == 16 ? ((const SInt16 *)b->mData)[idx] / 32768.0f
-			        : ((const SInt32 *)b->mData)[idx] / 2147483648.0f;
-			pcm[i] = v >= 1.0f ? 32767 : v <= -1.0f ? -32768 : (SInt16)lrintf(v * 32767.0f);
+	UInt32 n = 0;
+	/* input frame k: k = 0 is prev, k = i + 1 is frame i of this call */
+	while (phase + 1 <= frames) {
+		UInt32 k = (UInt32)phase;
+		float f = (float)(phase - k), a[2], b[2];
+		for (int c = 0; c < 2; c++) {
+			const AudioBuffer *buf = c ? r : l;
+			UInt32 off = c ? roff : 0;
+			a[c] = k == 0 ? prev[c] : tap_sample(buf, (k - 1) * step + off, is_float, bits);
+			b[c] = tap_sample(buf, k * step + off, is_float, bits);
+			pcm[2 * n + c] = pcm16(a[c] + (b[c] - a[c]) * f);
 		}
-		if (write(fd, pcm, n * 4) < 0) {
-			qlog("vsnd: write failed (%d), reopening", errno);
-			close(fd);
-			fd = -1;
-			return;
+		phase += ratio;
+		if (++n == VSND_FRAMES) {
+			if (write(fd, pcm, n * 4) < 0)
+				goto failed;
+			n = 0;
 		}
-		done += n;
 	}
+	phase -= frames;
+	if (frames) {
+		prev[0] = tap_sample(l, (frames - 1) * step, is_float, bits);
+		prev[1] = tap_sample(r, (frames - 1) * step + roff, is_float, bits);
+	}
+	if (n && write(fd, pcm, n * 4) < 0)
+		goto failed;
+	return;
+failed:
+	qlog("vsnd: write failed (%d), reopening", errno);
+	close(fd);
+	fd = -1;
 #endif
 }
 
