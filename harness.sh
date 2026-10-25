@@ -14,7 +14,8 @@
 # Ctrl+Option+Up/Down volume (patches 0084, 0089); sound plays on the host
 # (virtio-sound, CoreAudio; kernel 0108 + tools/audio-plugin.py setup DISK),
 # --no-audio leaves the sound device out. --metal (with --ios, macOS,
-# experimental): Metal remoting: boot-arg sweetmetal=1, shared memory for the
+# experimental): Metal remoting: boot-arg sweetmetal=1, guest RAM as a file on a
+# RAM disk (no SSD writeback) shared with the
 # guest's QEMUMetal.bundle (tools/metal-plugin.py setup DISK) and the host
 # helper tools/host/qemu-metal-host.m, whose output goes to the run's
 # metal-host.log (patches 0103/0104). --cpus N: vCPUs (default 4
@@ -119,10 +120,18 @@ if [ -n "$METAL" ]; then
 		xcrun clang -fobjc-arc -O2 -Wall -framework Foundation -framework Metal tools/host/qemu-metal-host.m -o "$HOST"
 	fi
 	mkdir -p "$OUT"
-	SHM=$OUT/guest-ram	# all of guest RAM (sparse); deleted after the run
+	# All of guest RAM is a shared file (stock QEMU on macOS cannot hand a named shm
+	# object to another process). macOS writes the dirty pages of shared file mappings
+	# back on its own: on the SSD that was 100-600 MB/s of 16 KB writes and QEMU
+	# beachballs. So the file lives on an APFS RAM disk (sparse file; the RAM disk only
+	# takes memory for pages actually written back), detached after the run.
+	RAMDEV=$(hdiutil attach -nomount ram://$((16 * 1024 * 1024 * 2)) | awk '{print $1}')
+	RAMVOL=ios-qemu-ram-$$
+	diskutil erasevolume APFS "$RAMVOL" "$RAMDEV" >/dev/null
+	SHM=/Volumes/$RAMVOL/guest-ram
 	"$HOST" "$SHM" > "$OUT/metal-host.log" 2>&1 &
 	HOST_PID=$!
-	trap 'kill $HOST_PID 2>/dev/null || true; rm -f "$SHM"' EXIT
+	trap 'kill $HOST_PID 2>/dev/null || true; diskutil unmountDisk force "$RAMDEV" >/dev/null 2>&1; hdiutil detach "$RAMDEV" -force >/dev/null 2>&1 || true' EXIT
 	QEMU_ARGS+=(--metal "$SHM")
 	echo "Metal host helper pid $HOST_PID, log $OUT/metal-host.log"
 fi
