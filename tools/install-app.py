@@ -52,11 +52,11 @@ def build():
 
 def disk_in_use(disk):
     real = os.path.realpath(disk)
-    out = subprocess.run(['ps', '-axo', 'command='], capture_output=True, text=True).stdout
+    out = subprocess.run(['ps', '-axww', '-o', 'command='], capture_output=True, text=True).stdout
     for line in out.splitlines():
         if 'qemu-system' in line:
-            m = re.search(r'file=([^,\s]+)', line)
-            if m and os.path.realpath(m.group(1)) == real:
+            # every file= (the loader's ram.bin and stub.bin come before the drive)
+            if any(os.path.realpath(f) == real for f in re.findall(r'file=([^,\s]+)', line)):
                 return True
     return False
 

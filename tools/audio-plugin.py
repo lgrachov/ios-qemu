@@ -34,7 +34,9 @@ def run(*cmd, **kw):
 
 def build(fake_vad=False):
     os.makedirs(BUNDLE, exist_ok=True)
-    run('xcrun', '-sdk', 'iphoneos', 'clang', '-arch', 'arm64', '-mios-version-min=16.0', '-Os', '-Wall', '-Wno-four-char-constants',
+    # arm64 for the iPhone X userland, arm64e for the XS: an arm64e mediaserverd
+    # only loads arm64e plug-ins
+    run('xcrun', '-sdk', 'iphoneos', 'clang', '-arch', 'arm64', '-arch', 'arm64e', '-mios-version-min=16.0', '-Os', '-Wall', '-Wno-four-char-constants',
         '-DQEMUAUDIO_FAKE_VAD=%d' % fake_vad,
         '-bundle', '-framework', 'CoreFoundation', '-o', os.path.join(BUNDLE, 'QEMUAudio'),
         os.path.join(SRC, 'QEMUAudio.c'))

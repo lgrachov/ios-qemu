@@ -68,10 +68,19 @@ def convert(root):
     print(f'{images} HEIC images converted to PNG, {layers} layers updated')
 
 
+def disk_in_use(disk):
+    """A running qemu has DISK (or a link to it) open as a drive."""
+    real = os.path.realpath(disk)
+    out = subprocess.run(['ps', '-axww', '-o', 'command='], capture_output=True, text=True).stdout
+    # every file= (the loader's ram.bin and stub.bin come before the drive)
+    return any(os.path.realpath(f) == real
+               for line in out.splitlines() if 'qemu-system' in line
+               for f in re.findall(r'file=([^,\s]+)', line))
+
+
 def with_disk(disk, fn):
     # fsck -fy and a read-write mount under a running guest corrupt the volume
-    if subprocess.run(['pgrep', '-f', 'qemu-system-aarch64.*' + re.escape(os.path.basename(disk))],
-                      stdout=subprocess.DEVNULL).returncode == 0:
+    if disk_in_use(disk):
         sys.exit(f'a VM is using {disk}: stop it first')
     dev = run('hdiutil', 'attach', '-nomount', '-imagekey', 'diskimage-class=CRawDiskImage', disk,
               capture_output=True, text=True).stdout.split()[0]

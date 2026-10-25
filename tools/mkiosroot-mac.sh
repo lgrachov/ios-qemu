@@ -8,12 +8,15 @@
 # Writes OUT_DIR/root.hfs (the volume: the same thing mkiosroot.sh makes for
 # the phone's userdata) and OUT_DIR/disk.img (4 KiB-sector GPT "userdata"
 # around it, tools/mkufsdisk.py). `ipsw info IPSW` names the three images.
+# Then adds the app installer (tools/install-app.py setup) and the sound
+# driver (tools/audio-plugin.py setup) to disk.img; both need Xcode with the
+# iOS SDK and run as the user who invoked sudo.
 # The APFS images mount natively; files are copied with GNU rsync
 # (brew install rsync), which reads them decompressed (the SWEET kernel has
 # no LZBITMAP decompressor) and keeps owners, modes and hard links.
 # See mkiosroot.sh for why each extra step is there.
 set -euo pipefail
-[[ $# -ge 4 ]] || { sed -n '2,13p' "$0"; exit 2; }
+[[ $# -ge 4 ]] || { sed -n '2,16p' "$0"; exit 2; }
 [[ $EUID == 0 ]] || { echo "run as root (sudo): the copy keeps root/mobile/_logd ownership" >&2; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
 os=$1 sysos=$2 appos=$3 outdir=$4 size=${5:-16g}
@@ -114,3 +117,9 @@ devs=("${devs[@]:1}")
 
 python3 -I "$here/mkufsdisk.py" "$disk" "$img"
 chown "${SUDO_UID:-0}:${SUDO_GID:-0}" "$img" "$disk"
+
+# Add-ons: they build with Xcode into research/guest, so not as root.
+asuser=()
+[[ -z ${SUDO_USER:-} ]] || asuser=(sudo -u "$SUDO_USER")
+"${asuser[@]}" python3 -I "$here/install-app.py" setup "$disk"
+"${asuser[@]}" python3 -I "$here/audio-plugin.py" setup "$disk"
