@@ -69,6 +69,10 @@ def convert(root):
 
 
 def with_disk(disk, fn):
+    # fsck -fy and a read-write mount under a running guest corrupt the volume
+    if subprocess.run(['pgrep', '-f', 'qemu-system-aarch64.*' + re.escape(os.path.basename(disk))],
+                      stdout=subprocess.DEVNULL).returncode == 0:
+        sys.exit(f'a VM is using {disk}: stop it first')
     dev = run('hdiutil', 'attach', '-nomount', '-imagekey', 'diskimage-class=CRawDiskImage', disk,
               capture_output=True, text=True).stdout.split()[0]
     mnt = tempfile.mkdtemp(prefix='ios-qemu-')
