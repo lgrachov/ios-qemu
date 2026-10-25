@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Boot the local kernel in QEMU with a live display window.
 #
-#   ./harness.sh [--secs N] [--no-display] [--no-log] [--hvf] [--ios DISK] [--no-audio] [--metal] [--cpus N] [--serial S] [--bootargs "..."] [--kernel PATH] [-- extra qemu-sweet.py args]
+#   ./harness.sh [--secs N] [--no-display] [--no-log] [--hvf] [--ios DISK] [--no-audio] [--metal] [--cpus N] [--serial S] [--device x|xs] [--bootargs "..."] [--kernel PATH] [-- extra qemu-sweet.py args]
 #
 # Runs until the QEMU window is closed, the guest powers off or Ctrl-C (which
 # still saves the screen); --secs N stops after N seconds instead.
@@ -19,7 +19,10 @@
 # helper tools/host/qemu-metal-host.m, whose output goes to the run's
 # metal-host.log (patches 0103/0104). --cpus N: vCPUs (default 4
 # with --ios, else 1; the kernel needs 0097 for N > 1). --serial S: the
-# device serial number (default QEMU00000001, tools/mkadt.py). The kernel log streams to
+# device serial number (default QEMU00000001, tools/mkadt.py). --device xs:
+# the iPhone XS identity (tools/mkadt.py --device xs) for an arm64e (XS) disk,
+# plus boot-arg sweetarm64e=1 (patch 0109; needs a CPU with PAC, as under
+# hvf on Apple Silicon); default x = iPhone X. The kernel log streams to
 # the terminal (qemu-sweet.py --live-log; --no-log turns it off). Results (fb.png, fb.txt, result.json)
 # go to research/qemu-local/run-<timestamp>/ (research/ is not in git).
 set -euo pipefail
@@ -38,6 +41,7 @@ CMDLINE='debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress'
 EXTRA=()
 MORE_ARGS=
 SERIAL=
+DEVICE=x
 
 while [ $# -gt 0 ]; do
 	case $1 in
@@ -46,6 +50,7 @@ while [ $# -gt 0 ]; do
 	--bootargs) MORE_ARGS=$2; shift 2 ;;
 	--cpus) CPUS=$2; shift 2 ;;
 	--serial) SERIAL=$2; shift 2 ;;
+	--device) DEVICE=$2; shift 2 ;;
 	--no-display) DISPLAY_ARG=; shift ;;
 	--no-log) LOG_ARG=; shift ;;
 	--hvf) HVF=--hvf; shift ;;
@@ -79,6 +84,11 @@ fi
 [ -n "$CPUS" ] || { [ -n "$IOS_DISK" ] && CPUS=4 || CPUS=1; }
 ADT_ARGS="$ADT_ARGS --cpus $CPUS" CMDLINE=${CMDLINE/cpus=1/cpus=$CPUS}
 [ -z "$SERIAL" ] || ADT_ARGS="$ADT_ARGS --serial $SERIAL"
+case $DEVICE in
+x) ;;
+xs) ADT_ARGS="$ADT_ARGS --device xs" CMDLINE="$CMDLINE sweetarm64e=1" ;;
+*) echo "unknown device: $DEVICE (x or xs)" >&2; exit 1 ;;
+esac
 QEMU_ARGS+=(--smp "$CPUS")
 mkdir -p "$W"
 if [ -n "$METAL" ]; then

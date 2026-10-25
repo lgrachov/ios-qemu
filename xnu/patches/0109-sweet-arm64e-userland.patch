@@ -1,0 +1,84 @@
+diff --git a/osfmk/arm/cpuid.c b/osfmk/arm/cpuid.c
+--- a/osfmk/arm/cpuid.c
++++ b/osfmk/arm/cpuid.c
+@@ -35,6 +35,8 @@
+ #include <arm/cpu_data_internal.h>
+ #include <arm64/proc_reg.h>
+ #include <kern/lock_rw.h>
++#include <kern/misc_protos.h>
++#include <kern/startup.h>
+ #include <vm/vm_page.h>
+ 
+ #include <libkern/section_keywords.h>
+@@ -85,6 +87,59 @@
+ 
+ /* Code */
+ 
++#if defined(SWEET) && !defined(HAS_APPLE_PAC)
++/*
++ * arm64e userland on this arm64 kernel (boot-arg sweetarm64e): report the
++ * ARM64E CPU subtype so exec grades arm64e slices (iPhone XS and newer
++ * userlands are arm64e only; otherwise launchd fails with EBADARCH). The
++ * PAC keys stay disabled (SCTLR_EL1 EnIA/EnIB/EnDA/EnDB clear without
++ * HAS_APPLE_PAC), so PAC instructions do not sign or authenticate, but the
++ * CPU must still implement them: retab/blraa/braa are not HINT space.
++ * sweetarm64e=1 needs FEAT_PAuth in ID_AA64ISAR1/ISAR2, =2 skips the check.
++ * Shared caches (slide info v3) and thread state need no change: without
++ * ptrauth the v3 slider stores authenticated pointers as plain addresses
++ * and thread state is passed through unconverted.
++ */
++static int sweet_arm64e_mode = -1;
++static uint64_t sweet_arm64e_isar1, sweet_arm64e_isar2;
++
++static bool
++sweet_arm64e_pauth(void)
++{
++	return (sweet_arm64e_isar1 & (ID_AA64ISAR1_EL1_APA_MASK | ID_AA64ISAR1_EL1_API_MASK)) != 0 ||
++	       ((sweet_arm64e_isar2 >> 12) & 0xf) != 0; /* APA3 */
++}
++
++static bool
++sweet_arm64e(void)
++{
++	if (sweet_arm64e_mode < 0) {
++		sweet_arm64e_mode = 0;
++		(void)PE_parse_boot_argn("sweetarm64e", &sweet_arm64e_mode, sizeof(sweet_arm64e_mode));
++		sweet_arm64e_isar1 = __builtin_arm_rsr64("ID_AA64ISAR1_EL1");
++		sweet_arm64e_isar2 = __builtin_arm_rsr64("S3_0_C0_C6_2"); /* ID_AA64ISAR2_EL1 */
++	}
++	return sweet_arm64e_mode == 2 || (sweet_arm64e_mode == 1 && sweet_arm64e_pauth());
++}
++
++/* do_cpuid runs before the console exists: report once it does. */
++static void
++sweet_arm64e_report(void)
++{
++	if (sweet_arm64e_mode <= 0) {
++		return;
++	}
++	uint64_t sctlr = __builtin_arm_rsr64("SCTLR_EL1");
++	/* EnIA 31, EnIB 30, EnDA 27, EnDB 13 (proc_reg.h names need HAS_APPLE_PAC) */
++	printf("SWEET arm64e: sweetarm64e=%d ISAR1 0x%llx ISAR2 0x%llx PAuth %s, "
++	    "SCTLR keys IA%d IB%d DA%d DB%d, CPU subtype %s\n", sweet_arm64e_mode,
++	    sweet_arm64e_isar1, sweet_arm64e_isar2, sweet_arm64e_pauth() ? "yes" : "no",
++	    (int)(sctlr >> 31) & 1, (int)(sctlr >> 30) & 1, (int)(sctlr >> 27) & 1, (int)(sctlr >> 13) & 1,
++	    sweet_arm64e() ? "ARM64E" : "ARM64_V8 (no PAuth)");
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, sweet_arm64e_report);
++#endif /* defined(SWEET) && !defined(HAS_APPLE_PAC) */
++
+ __private_extern__
+ void
+ do_cpuid(void)
+@@ -96,6 +151,11 @@
+ 	cpuid_cpu_info.arm_info.arm_arch = CPU_ARCH_ARMv8E;
+ #else /* defined(HAS_APPLE_PAC) */
+ 	cpuid_cpu_info.arm_info.arm_arch = CPU_ARCH_ARMv8;
++#if defined(SWEET)
++	if (sweet_arm64e()) {
++		cpuid_cpu_info.arm_info.arm_arch = CPU_ARCH_ARMv8E;
++	}
++#endif /* defined(SWEET) */
+ #endif /* defined(HAS_APPLE_PAC) */
+ 
+ #else /* (__ARM_ARCH__ != 8) */

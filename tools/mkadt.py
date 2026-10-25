@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--hvf] [--qemu-ufs] [--qemu-fullfb] [--highmem] [--cpus N] [--serial S]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--hvf] [--qemu-ufs] [--qemu-fullfb] [--highmem] [--cpus N] [--serial S] [--device x|xs]
 """
 import hashlib, os, struct, sys
 
@@ -30,11 +30,11 @@ GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
 FB, FB_SIZE = 0x9c000000, 0x1700000
 SWEET_ECID = 0x51454d5500000001  # 'QEMU' + 1, synthetic
-# Factory identity (syscfg SrNm/Mod#/Regn/MLB#), synthetic serials: a silver
-# 64 GB iPhone X, iPhone10,3 = A1865, part number MQA62LL/A (Mod# + Regn).
+# Factory identity (syscfg SrNm/MLB#), synthetic serials; Mod# + Regn come
+# from DEVICES.
 SERIAL = 'QEMU00000001'
 MLB_SERIAL = 'QEMUMLB000000001'
-MODEL_NUMBER, REGION_INFO = 'MQA62', 'LL/A'
+REGION_INFO = 'LL/A'
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # QEMU (qemu-sweet.py --fullfb): the whole presented iPhone X display, no crop.
 # Unpadded rows (iOS pads its own surfaces to 4608; nothing needs it here).
@@ -55,17 +55,27 @@ QEMU_HVF_TIMEBASE = 24000000
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
-# The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
-# derives product type, device class, home-button-less UI, artwork etc. from
-# the root identity and /product of the real D22AP device tree. That tree is
-# an Apple artifact (kept out of git): extract it from the IPSW with
+# The device whose IPSW userland runs here. MobileGestalt derives product
+# type, device class, home-button-less UI, artwork etc. from the root identity
+# and /product of the real device tree. Those trees are Apple artifacts (kept
+# out of git): extract them from the IPSW with
 #   tools/remotezip.py URL DeviceTree.d22ap.im4p DIR
 #   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
-D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
+# Both have the same 1125x2436 @3x Face ID screen and no Home button.
+_RESEARCH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research')
+DEVICES = {
+    # iPhone X (A11, arm64 userland): iOS 16.7.16. Silver 64 GB, A1865, MQA62LL/A.
+    'x': dict(model='iPhone10,3', board='D22AP', target='D22', chip_id=0x8015,
+              model_number='MQA62', adt=os.path.join(_RESEARCH, 'ipsw-x/d22ap.adt')),
+    # iPhone XS (A12, arm64e userland): iOS 16.6.1 probe, later iOS 18.
+    # Silver 64 GB, A1920; MT952LL/A from a reseller listing (unverified).
+    'xs': dict(model='iPhone11,2', board='D321AP', target='D321', chip_id=0x8020,
+               model_number='MT952', adt=os.path.join(_RESEARCH, 'ipsw-xs/d321ap.adt')),
+}
 
 
-def d22ap_product(path=D22AP_ADT):
-    """/product properties of the real D22AP tree, without the syscfg
+def device_product(path):
+    """/product properties of the real device tree, without the syscfg
     placeholders iBoot would fill in (flag bit set) and the node bookkeeping."""
     if not os.path.exists(path):
         print(f'warning: {path} missing, no /product node', file=sys.stderr)
@@ -90,12 +100,14 @@ def node(name, props=(), children=()):
 
 
 def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False, qemu_fullfb=False, qemu_cpus=1,
-          serial=SERIAL):
+          serial=SERIAL, device='x'):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     hvf=True (implies qemu): the host's counter frequency, for qemu-sweet.py --hvf.
     qemu_ufs=True (implies qemu): /sweet-ufs at QEMU's UFS BAR, for qemu-sweet.py --ufs.
     qemu_fullfb=True (implies qemu): a 1125x2436 sweet-fbcon, for qemu-sweet.py --fullfb.
-    qemu_cpus=N: N CPU nodes with QEMU virt's MPIDRs, for qemu-sweet.py --smp N (kernel cpus=N)."""
+    qemu_cpus=N: N CPU nodes with QEMU virt's MPIDRs, for qemu-sweet.py --smp N (kernel cpus=N).
+    device: key of DEVICES, the device whose userland runs (default iPhone X)."""
+    dev = DEVICES[device]
     qemu = qemu or hvf or qemu_ufs or qemu_fullfb
     fb_w, fb_h, fb_stride = QEMU_FULL_FB if qemu_fullfb else (FB_W, FB_H, FB_STRIDE)
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
@@ -140,9 +152,9 @@ def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False, qemu_
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
         # files), so e.g. DataMigration never records LastSystemVersion and
         # migrates on every boot. Synthetic ECID (not the phone's); chip-id
-        # of the A11 that the iPhone X userland expects.
+        # of the SoC the device's userland expects (A11 0x8015, A12 0x8020).
         ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
-        ('chip-id', u32(0x8015)),
+        ('chip-id', u32(dev['chip_id'])),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
         # DeviceType then takes its native "Hactivation" branch (state
@@ -256,7 +268,7 @@ def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False, qemu_
         ('opposed-power-vol-buttons', u32(1)),
     ])
 
-    product_props = d22ap_product()
+    product_props = device_product(dev['adt'])
     if product_props and qemu_fullfb:
         # QEMU (--qemu-fullfb): report an sRGB display. With the iPhone X's P3
         # WebKit renders pages into 10-bit 'w30r' IOSurfaces that come out
@@ -269,21 +281,21 @@ def build(seed=None, qemu=False, highmem=False, hvf=False, qemu_ufs=False, qemu_
     # dram-size we expose, so XNU maps it but never allocates into it.
     pram = node('pram', [ph(), ('reg', u64(panic_base) + u64(PANIC_LOG_SIZE))])
 
-    # Identity of the iPhone X whose userland runs here: compatible[0] is
+    # Identity of the device whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
-        ('model', cstr('iPhone10,3')),
-        ('target-type', cstr('D22')),
-        ('target-sub-type', cstr('D22AP')),
+        ('compatible', cstr(dev['board']) + cstr(dev['model']) + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('model', cstr(dev['model'])),
+        ('target-type', cstr(dev['target'])),
+        ('target-sub-type', cstr(dev['board'])),
         # iBoot fills these from syscfg as 0x20-byte zero-padded strings
         # (placeholders like syscfg/SrNm/0x20,zeroes/0x20 in the D22AP tree);
         # without them iOS has no serial or model number (Settings > About).
         ('serial-number', syscfg_str(serial)),
         ('mlb-serial-number', syscfg_str(MLB_SERIAL)),
-        ('model-number', syscfg_str(MODEL_NUMBER)),
+        ('model-number', syscfg_str(dev['model_number'])),
         ('region-info', syscfg_str(REGION_INFO)),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
@@ -295,7 +307,8 @@ if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, hvf='--hvf' in sys.argv,
                  qemu_ufs='--qemu-ufs' in sys.argv, qemu_fullfb='--qemu-fullfb' in sys.argv,
                  qemu_cpus=int(sys.argv[sys.argv.index('--cpus') + 1]) if '--cpus' in sys.argv else 1,
-                 serial=sys.argv[sys.argv.index('--serial') + 1] if '--serial' in sys.argv else SERIAL)
+                 serial=sys.argv[sys.argv.index('--serial') + 1] if '--serial' in sys.argv else SERIAL,
+                 device=sys.argv[sys.argv.index('--device') + 1] if '--device' in sys.argv else 'x')
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
