@@ -23,7 +23,8 @@ on:
       - ".github/workflows/xnu.yml"
 
 concurrency:
-  group: xnu-${{ github.ref }}
+  # per macOS version: the 13.5 and 15.6 builds of a branch run side by side
+  group: xnu-${{ github.ref }}-${{ inputs.macos_version || '13.5' }}
   cancel-in-progress: true
 
 env:
