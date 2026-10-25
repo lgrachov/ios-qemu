@@ -65,7 +65,7 @@ index 0000000000000000000000000000000000000000..18300b4e95a3fa08f21404b655cdb9ca
 +#endif
 diff --git a/bsd/pthread/sweet_pthread_init.c b/bsd/pthread/sweet_pthread_init.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..5a82439b66725e02c5bd33e1983f7e4d3049f045
+index 0000000000000000000000000000000000000000..c4674def1a2a415bd5ea86a0bdcad1cc621ebfea
 --- /dev/null
 +++ b/bsd/pthread/sweet_pthread_init.c
 @@ -0,0 +1,26 @@
@@ -91,7 +91,7 @@ index 0000000000000000000000000000000000000000..5a82439b66725e02c5bd33e1983f7e4d
 +    if (kr != KERN_SUCCESS || sweet_pthread_kern == NULL) {
 +        panic("SWEET: pthread provider registration failed: %d", kr);
 +    }
-+    kprintf("SWEET pthread: libpthread-514.100.2 registered\n");
++    kprintf("SWEET pthread: libpthread-536 registered\n");
 +}
 +STARTUP(EARLY_BOOT, STARTUP_RANK_SECOND, sweet_pthread_register);
 +#endif /* ARM64_BOARD_CONFIG_SWEET */

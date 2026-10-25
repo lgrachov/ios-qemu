@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 2545cf9f9a2a342972c6967f9d2bec78662d7058..eb8d82ca74008ebd7d9d07536d3daa2bb1e67785 100644
+index 2545cf9f9a2a342972c6967f9d2bec78662d7058..c732a90d3341e50fc4bdc8733727552ac3df2030 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
 @@ -17,6 +17,7 @@
@@ -71,3 +71,18 @@ index 2545cf9f9a2a342972c6967f9d2bec78662d7058..eb8d82ca74008ebd7d9d07536d3daa2b
  	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
  	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
  
+@@ -150,11 +171,9 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+-		kern_return_t kr = processor_start(cpu->machProcessor);
+-		if (kr != KERN_SUCCESS) {
+-			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+-		}
+-		/* processor_start() is asynchronous for secondaries in this XNU. */
++		/* xnu-11417: ml_processor_register() boots every CPU itself and
++		 * processor_start() from a kext is a no-op that returns
++		 * KERN_FAILURE (processor_start_from_kext), so only wait here. */
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !sweet_cpu_signal_is_enabled(i)) {
