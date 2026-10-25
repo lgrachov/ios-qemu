@@ -1,0 +1,87 @@
+diff --git a/osfmk/vm/vm_dyld_pager.c b/osfmk/vm/vm_dyld_pager.c
+--- a/osfmk/vm/vm_dyld_pager.c
++++ b/osfmk/vm/vm_dyld_pager.c
+@@ -58,10 +58,10 @@
+ 
+ #include <sys/kdebug_triage.h>
+ #include <mach-o/fixup-chains.h>
+-#if defined(HAS_APPLE_PAC)
++#if defined(HAS_APPLE_PAC) || defined(SWEET)
+ #include <ptrauth.h>
+ #include <arm/misc_protos.h>
+-#endif /* defined(HAS_APPLE_PAC) */
++#endif /* defined(HAS_APPLE_PAC) || defined(SWEET) */
+ 
+ /*
+  * DYLD page in linking pager.
+@@ -425,9 +425,14 @@
+ 	return KERN_SUCCESS;
+ }
+ 
+-#if defined(HAS_APPLE_PAC)
++#if defined(HAS_APPLE_PAC) || defined(SWEET)
+ /*
+  * Sign a pointer needed for fixups.
++ * SWEET: arm64e userland on the arm64 kernel (patch 0109) runs with the PAC
++ * keys off, so authenticated fixups are stored as plain pointers (what
++ * arm_user_jop_disabled() selects on a PAC kernel). Without this, dyld's
++ * page-in linking of arm64e images (DYLD_CHAINED_PTR_ARM64E_USERLAND24, e.g.
++ * launchd) fails with "unknown pointer_format 12".
+  */
+ static kern_return_t
+ signPointer(
+@@ -445,19 +450,27 @@
+ 		return KERN_SUCCESS;
+ 	}
+ 
++#if defined(HAS_APPLE_PAC)
+ 	uint64_t extendedDiscriminator = diversity;
+ 	if (addrDiv) {
+ 		extendedDiscriminator = __builtin_ptrauth_blend_discriminator(loc, extendedDiscriminator);
+ 	}
++#else /* SWEET */
++	(void)loc; (void)addrDiv; (void)diversity; (void)pager;
++#endif /* defined(HAS_APPLE_PAC) */
+ 
+ 	switch (key) {
+ 	case ptrauth_key_asia:
+ 	case ptrauth_key_asda:
++#if defined(HAS_APPLE_PAC)
+ 		if (pager->dyld_a_key == 0 || arm_user_jop_disabled()) {
+ 			*signedAddr = unsignedAddr;
+ 		} else {
+ 			*signedAddr = (uintptr_t)pmap_sign_user_ptr((void *)unsignedAddr, key, extendedDiscriminator, pager->dyld_a_key);
+ 		}
++#else /* SWEET */
++		*signedAddr = unsignedAddr;
++#endif /* defined(HAS_APPLE_PAC) */
+ 		break;
+ 
+ 	default:
+@@ -563,7 +576,7 @@
+ 	} while (delta != 0);
+ 	return KERN_SUCCESS;
+ }
+-#endif /* defined(HAS_APPLE_PAC) */
++#endif /* defined(HAS_APPLE_PAC) || defined(SWEET) */
+ 
+ 
+ /*
+@@ -649,7 +662,7 @@
+ 	 * Route to the appropriate fixup routine
+ 	 */
+ 	switch (hdr->mwli_pointer_format) {
+-#if defined(HAS_APPLE_PAC)
++#if defined(HAS_APPLE_PAC) || defined(SWEET)
+ 	case DYLD_CHAINED_PTR_ARM64E:
+ 		fixupPageAuth64(userVA, contents, end_contents, pager, segInfo, pageIndex, false);
+ 		break;
+@@ -657,7 +670,7 @@
+ 	case DYLD_CHAINED_PTR_ARM64E_USERLAND24:
+ 		fixupPageAuth64(userVA, contents, end_contents, pager, segInfo, pageIndex, true);
+ 		break;
+-#endif /* defined(HAS_APPLE_PAC) */
++#endif /* defined(HAS_APPLE_PAC) || defined(SWEET) */
+ 	case DYLD_CHAINED_PTR_64:
+ 		fixupPage64(contents, end_contents, link_info, segInfo, pageIndex, false);
+ 		break;
