@@ -1,5 +1,5 @@
 diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
-index 90bcb64b7f4dcfd13b05c60a78d3da1ee2c5abe4..13f43a399714976d38fca6dfc0d8a1b70a0cd8b6 100644
+index 90bcb64b7f4dcfd13b05c60a78d3da1ee2c5abe4..941d0667e06c270a5f2cc6852c5e6c02ea1534fe 100644
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
 @@ -30,6 +30,7 @@
@@ -22,7 +22,7 @@ index 90bcb64b7f4dcfd13b05c60a78d3da1ee2c5abe4..13f43a399714976d38fca6dfc0d8a1b7
   */
  static uint64_t sweet_sandbox_seen;
  
-@@ -369,6 +371,67 @@ sweet_sandbox_extension_consume(user_addr_t arg)
+@@ -369,6 +371,92 @@ sweet_sandbox_extension_consume(user_addr_t arg)
  	return copyout(&handle, args.handle, sizeof(handle));
  }
  
@@ -87,14 +87,42 @@ index 90bcb64b7f4dcfd13b05c60a78d3da1ee2c5abe4..13f43a399714976d38fca6dfc0d8a1b7
 +	return copyout(SWEET_MOBILE_HOME, args.buf, sizeof(SWEET_MOBILE_HOME));
 +}
 +
++/*
++ * Op 0x43, libsystem_sandbox's sandbox_get_container_expected(bool *, bool *):
++ * the argument holds two user pointers; each receives a u64 that the library
++ * turns into a bool. iOS 18 launchd's _container_init() treats an error as
++ * fatal (iOS 16 tolerated ENOENT). Nothing is sandboxed here: answer "no
++ * container expected" for both flags.
++ */
++static int
++sweet_sandbox_container_expected(user_addr_t arg)
++{
++	struct {
++		uint64_t expected;
++		uint64_t second;
++	} args;
++	uint64_t zero = 0;
++	int error = copyin(arg, &args, sizeof(args));
++	if (error == 0 && args.expected != 0) {
++		error = copyout(&zero, (user_addr_t)args.expected, sizeof(zero));
++	}
++	if (error == 0 && args.second != 0) {
++		error = copyout(&zero, (user_addr_t)args.second, sizeof(zero));
++	}
++	return error;
++}
++
  static int
  sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
  {
-@@ -384,6 +447,7 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+@@ -384,8 +472,9 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
  	case 6:         /* extension consume */
  		return sweet_sandbox_extension_consume(arg);
  	case 4:         /* container path (audit token / pid) */
 +		return sweet_sandbox_container_path(p, arg);
  	case 0x43:      /* container expected */
- 		return ENOENT;
+-		return ENOENT;
++		return sweet_sandbox_container_expected(arg);
  	default:
+ 		return 0;
+ 	}
