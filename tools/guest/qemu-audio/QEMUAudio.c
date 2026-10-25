@@ -247,6 +247,7 @@ static AudioStreamBasicDescription stream_format(void)
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <execinfo.h>
+#include <sys/sysctl.h>
 
 static OSStatus (*real_get)(AudioObjectID, const AudioObjectPropertyAddress *, UInt32, const void *, UInt32 *, void *);
 static OSStatus (*real_size)(AudioObjectID, const AudioObjectPropertyAddress *, UInt32, const void *, UInt32 *);
@@ -316,6 +317,14 @@ static void trace_image(const struct mach_header *mh, intptr_t slide)
 	if (!dladdr(mh, &info) || !info.dli_fname || !strstr(info.dli_fname, "/VirtualAudio.plugin/"))
 		return;
 	va_base = (uintptr_t)mh;
+	/* which product VirtualAudio thinks it runs on: MobileGestalt's product
+	 * type hash -> VirtualAudio's product enum (fn 0x5026c, 0 = unknown) */
+	uint64_t (*mg_type)(void) = dlsym(RTLD_DEFAULT, "MGGetProductType");
+	char model[64] = "";
+	size_t msz = sizeof(model);
+	sysctlbyname("hw.model", model, &msz, NULL, 0);
+	qlog("trace: hw.model %s, MGGetProductType %#llx, VirtualAudio product %d", model,
+	     mg_type ? (unsigned long long)mg_type() : 0ULL, ((int (*)(void))(va_base + 0x5026c))());
 	unsigned long size;
 	uint8_t *got = getsectiondata((const struct mach_header_64 *)mh, "__DATA_CONST", "__got", &size);
 	if (!got)
@@ -359,7 +368,7 @@ static void trace_va(void)
  * So once our devices are in, send the request MediaExperience would send for
  * playback: category 'csav', mode 'imdf'.
  */
-#define QEMUAUDIO_REROUTE 0	/* 2026-10-25: accepted, but served from VirtualAudio's route cache */
+#define QEMUAUDIO_REROUTE 0	/* 2026-10-25: accepted; at 5/15 s and at 45/60 s (ringer on, devices in) still pap -> pnul */
 #if QEMUAUDIO_REROUTE
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
@@ -412,6 +421,31 @@ static void reroute(void)
 }
 #endif
 
+/*
+ * QEMUAUDIO_RINGER: VirtualAudio culls speaker routes while the ringer switch
+ * is off ("Culling route connection because ringer switch is off", for the
+ * categories that obey it, e.g. 'csav' system sounds and 'crng'). It reads the
+ * switch from notify state com.apple.springboard.ringerstate, which SpringBoard
+ * sets only ~37 s into boot, after the first routes were computed. Set it (1 =
+ * ringer on) before VirtualAudio starts.
+ */
+#define QEMUAUDIO_RINGER 1
+#define QEMUAUDIO_JACK_SECS 8	/* 50 tried: no route either */
+#if QEMUAUDIO_RINGER
+#include <notify.h>
+
+static void ringer_on(void)
+{
+	int token;
+	uint32_t st = notify_register_check("com.apple.springboard.ringerstate", &token);
+	if (st == NOTIFY_STATUS_OK)
+		st = notify_set_state(token, 1);
+	if (st == NOTIFY_STATUS_OK)
+		st = notify_post("com.apple.springboard.ringerstate");
+	qlog("ringer state set to on: status %u", st);
+}
+#endif
+
 /* ---- IUnknown ---- */
 
 static AudioServerPlugInDriverInterface iface;
@@ -454,8 +488,11 @@ static OSStatus Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRe
 #if QEMUAUDIO_TRACE_VA
 	trace_va();
 #endif
+#if QEMUAUDIO_RINGER
+	ringer_on();
+#endif
 #if QEMUAUDIO_HEADPHONES && !QEMUAUDIO_FAKE_VAD
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, QEMUAUDIO_JACK_SECS * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
 		jack_connected = 1;
 		AudioObjectPropertyAddress ch = { 'jack', kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain };
 		AudioObjectPropertyAddress val = { kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal,
@@ -466,7 +503,7 @@ static OSStatus Initialize(AudioServerPlugInDriverRef d, AudioServerPlugInHostRe
 	});
 #endif
 #if QEMUAUDIO_REROUTE && !QEMUAUDIO_FAKE_VAD
-	for (int t = 5; t <= 15; t += 10)
+	for (int t = 45; t <= 60; t += 15)
 		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, t * NSEC_PER_SEC),
 			       dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ reroute(); });
 #endif
