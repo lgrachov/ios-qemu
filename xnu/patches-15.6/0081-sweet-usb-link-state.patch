@@ -1,8 +1,16 @@
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index 9c42e451540c01ca5c819acc4cc5b16cd7223c55..b6c1a41ba73792cb71d4ce36d4cc5c037eddb791 100644
+index 9c42e451540c01ca5c819acc4cc5b16cd7223c55..bacc19e5762247b8b8ab608b896fdd27a1634160 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
-@@ -33,6 +33,9 @@
+@@ -20,6 +20,7 @@
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+@@ -33,6 +34,9 @@
  #include <net/kpi_interface.h>
  #include <net/kpi_protocol.h>
  #include <netinet/in.h>
@@ -12,7 +20,7 @@ index 9c42e451540c01ca5c819acc4cc5b16cd7223c55..b6c1a41ba73792cb71d4ce36d4cc5c03
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  void sweet_usb_probe(void);
-@@ -375,6 +378,7 @@ ud_string(unsigned idx, uint8_t *out)
+@@ -375,6 +379,7 @@ ud_string(unsigned idx, uint8_t *out)
  
  static void ud_rx_arm(void);
  static void ud_tx_kick_locked(void);
@@ -20,7 +28,7 @@ index 9c42e451540c01ca5c819acc4cc5b16cd7223c55..b6c1a41ba73792cb71d4ce36d4cc5c03
  
  /* NETWORK_CONNECTION notification: the host brings its link up on it. */
  static void
-@@ -455,6 +459,7 @@ ud_setup(void)
+@@ -455,6 +460,7 @@ ud_setup(void)
  			ud.data_alt = (uint8_t)value;
  			if (value == 1 && ud.configured) {
  				ud_notify_connected();
@@ -28,7 +36,7 @@ index 9c42e451540c01ca5c819acc4cc5b16cd7223c55..b6c1a41ba73792cb71d4ce36d4cc5c03
  			}
  		}
  	} else if (req == 10) {         /* GET_INTERFACE */
-@@ -571,10 +576,41 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+@@ -571,10 +577,41 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
  	return 0;
  }
  

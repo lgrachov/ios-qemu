@@ -1,8 +1,17 @@
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index b7fbdf613eb393db88dbdef4714d106b042aa1fb..9b8a6a508102bc7c4d23ffc944472e5261f4d22c 100644
+index b7fbdf613eb393db88dbdef4714d106b042aa1fb..16a10a5997fa75981a88a19bb5880d55c9e465e6 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -1018,6 +1018,15 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+@@ -967,6 +967,8 @@ exception_triage(
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <vm/vm_shared_region.h>
++#include <vm/vm_shared_region_xnu.h>
++#include <vm/vm_map_internal.h>
+ #include <arm/thread.h>
+ 
+ /*
+@@ -1018,6 +1020,15 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
  	}
  	printf("%s\n", line);
  

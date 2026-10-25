@@ -11,10 +11,18 @@ index 16750eb172145ede8a37405308f714aef11888df..833a3652ca306f6e8dd4036478251baa
  bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index b03729a9831e808768aa61ed59295ec2fdb095e0..ab5c349b1b768527b5e4f5afcb595ee247b7dbb8 100644
+index b03729a9831e808768aa61ed59295ec2fdb095e0..ac06fe5bf47fd48197939d73a6c33cc79c0315d0 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -56,6 +56,7 @@ extern void sweet_usb_probe(void);
+@@ -35,6 +35,7 @@
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+@@ -56,6 +57,7 @@ extern void sweet_usb_probe(void);
  extern void sweet_vinput_init(void);
  extern void sweet_vnet_init(void);
  extern void sweet_mux_init(void);
@@ -22,7 +30,7 @@ index b03729a9831e808768aa61ed59295ec2fdb095e0..ab5c349b1b768527b5e4f5afcb595ee2
  
  #define REG_CAP         0x00
  #define REG_IS          0x20
-@@ -666,6 +667,7 @@ sweet_ufs_init(void)
+@@ -666,6 +668,7 @@ sweet_ufs_init(void)
  	sweet_vinput_init();         /* QEMU only (boot-arg sweetvinput=1) */
  	sweet_vnet_init();           /* QEMU only (boot-arg sweetvnet=1) */
  	sweet_mux_init();            /* QEMU only, lockdownd over en0 (sweetvnet=1) */
@@ -32,10 +40,10 @@ index b03729a9831e808768aa61ed59295ec2fdb095e0..ab5c349b1b768527b5e4f5afcb595ee2
  
 diff --git a/bsd/dev/sweet_vsnd.c b/bsd/dev/sweet_vsnd.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..b7b7c979821727fe288d0098b334326b8d7e8fd4
+index 0000000000000000000000000000000000000000..ed979c4f07a8124095d9b0ce3a4a3375c7cd15be
 --- /dev/null
 +++ b/bsd/dev/sweet_vsnd.c
-@@ -0,0 +1,476 @@
+@@ -0,0 +1,477 @@
 +/*
 + * SWEET under QEMU: virtio-sound (virtio-mmio, modern) playback.
 + *
@@ -67,6 +75,7 @@ index 0000000000000000000000000000000000000000..b7b7c979821727fe288d0098b334326b
 +#include <kern/locks.h>
 +#include <vm/pmap.h>
 +#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +

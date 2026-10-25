@@ -38,15 +38,22 @@ index 76d70a524b8254896f31234e4727e1367e105623..e5d407d96c48a9ac1453b313b7fcd5b1
  		cpu_boot_arg = 1;
  	}
 diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
-index 789187c68287712bc5852efba6123b90928197b0..b99c2f49a0e1313560072d19e7760119461cdccf 100644
+index 789187c68287712bc5852efba6123b90928197b0..8dfdfb67d853947d56ae58db46de5c3d5e260fae 100644
 --- a/pexpert/pexpert/arm64/SWEET.h
 +++ b/pexpert/pexpert/arm64/SWEET.h
-@@ -17,8 +17,13 @@
+@@ -17,8 +17,20 @@
  
  #define SWEET                     1
  
 -/* Six homogeneous A55s; cpus=N is clamped here until A76/AMP is audited. */
 -#define SWEET_SMP_MAX_CPUS         6
++/*
++ * xnu-11417: apple_arm64_cpu.h (included by sleh.c, pcb.c, ...) uses the
++ * MPIDR core-type constants that Apple boards get from apple_arm64_regs.h
++ * via apple_arm64_common.h, which SWEET does not include.
++ */
++#include <pexpert/arm64/apple_arm64_regs.h>
++
 +/*
 + * All eight cores (six A55 + two A76) as one homogeneous SMP cluster:
 + * cpus=N is clamped here. Same ISA level (ARMv8.2), 64-byte lines, PSCI

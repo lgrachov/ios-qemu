@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_vinput.c b/bsd/dev/sweet_vinput.c
-index 15509b94df1067665b93cadcb9b919157f3cbde4..e647bc8382d8f89adcfa747382dd65d1175715e9 100644
+index 15509b94df1067665b93cadcb9b919157f3cbde4..25fffffd9e85a35d6f6a93cec27a5effb0f7e741 100644
 --- a/bsd/dev/sweet_vinput.c
 +++ b/bsd/dev/sweet_vinput.c
 @@ -10,8 +10,11 @@
@@ -16,7 +16,15 @@ index 15509b94df1067665b93cadcb9b919157f3cbde4..e647bc8382d8f89adcfa747382dd65d1
   *
   * QEMU's virtio is cache coherent with the guest, so no cache maintenance.
   * Needs -global virtio-mmio.force-legacy=false (modern register layout).
-@@ -33,6 +36,7 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -25,6 +28,7 @@
+ #include <kern/sched_prim.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -33,6 +37,7 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
  extern kern_return_t thread_terminate(thread_t);
  extern void sweet_hid_touch(int finger, int down, int x, int y);
  extern void sweet_hid_key(int key, int down);
@@ -24,7 +32,7 @@ index 15509b94df1067665b93cadcb9b919157f3cbde4..e647bc8382d8f89adcfa747382dd65d1
  void sweet_vinput_init(void);
  
  #define VMMIO_PA        0x0a000000u
-@@ -77,12 +81,40 @@ void sweet_vinput_init(void);
+@@ -77,12 +82,40 @@ void sweet_vinput_init(void);
  #define BTN_LEFT        0x110
  #define BTN_TOUCH       0x14a
  #define KEY_ESC         1
@@ -65,7 +73,7 @@ index 15509b94df1067665b93cadcb9b919157f3cbde4..e647bc8382d8f89adcfa747382dd65d1
  #define QSIZE           64u
  #define MAX_DEVS        4u
  /* One 16 KiB page per device: descriptors, avail ring, used ring, buffers. */
-@@ -117,6 +149,8 @@ static struct {
+@@ -117,6 +150,8 @@ static struct {
  	struct vinput_dev dev[MAX_DEVS];
  	unsigned ndev;
  	int abs_x, abs_y;
@@ -74,7 +82,7 @@ index 15509b94df1067665b93cadcb9b919157f3cbde4..e647bc8382d8f89adcfa747382dd65d1
  	int panel_w, panel_h;
  	bool button, down;
  	bool started;
-@@ -217,11 +251,27 @@ vinput_event(const struct vinput_event *ev)
+@@ -217,11 +252,27 @@ vinput_event(const struct vinput_event *ev)
  	case EV_KEY:
  		if (ev->code == BTN_LEFT || ev->code == BTN_TOUCH) {
  			vi.button = ev->value != 0;
