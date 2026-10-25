@@ -12,7 +12,7 @@ index 875058b28eb65e70ff8f2e2d664134acb7c89153..fa87612e865e260ce9ef7432a9225ac4
  	publishUserResource(gIOResourceIOKitKey);
  #endif
 diff --git a/libkern/c++/OSKext.cpp b/libkern/c++/OSKext.cpp
-index 8c4d510608153abf34d4b90b4c7e2efbd5863d7f..0c4f936ce118220c84feb9b810d364d7ad4ee0d5 100644
+index 8c4d510608153abf34d4b90b4c7e2efbd5863d7f..b52b99658fb93fa54ac484b7c54d8f4d12400621 100644
 --- a/libkern/c++/OSKext.cpp
 +++ b/libkern/c++/OSKext.cpp
 @@ -1607,6 +1607,15 @@ OSKext::driverkitEnabled(void)
@@ -31,3 +31,31 @@ index 8c4d510608153abf34d4b90b4c7e2efbd5863d7f..0c4f936ce118220c84feb9b810d364d7
  #if !XNU_TARGET_OS_IOS && !XNU_TARGET_OS_OSX
  	int notused;
  	if (PE_parse_boot_argn("-restore", &notused, sizeof(notused))) {
+@@ -10376,7 +10385,14 @@ OSKext::handleRequest(
+ 	    predicate->isEqualTo(kKextRequestPredicateAuxKCBundleAvailable) ||
+ 	    predicate->isEqualTo(kKextRequestPredicateDaemonReady)) {
+ 		if (!iokitDaemonAvailable()) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			/* No kernelmanagerd (see iokitDaemonAvailable): iOS 18's
++			 * userland still sends these (e.g. driverkitd); refuse. */
++			result = kOSKextReturnUnsupported;
++			goto finish;
++#else
+ 			panic("Received unexpected request in environment where " kIOKitDaemonName " is unavailable");
++#endif
+ 		}
+ 		if (hostPriv == HOST_PRIV_NULL) {
+ 			OSKextLog(/* kext */ NULL,
+@@ -12909,7 +12925,12 @@ OSKext::requestDaemonLaunch(
+ 		return kOSKextReturnInvalidArgument;
+ 	}
+ 	if (!iokitDaemonAvailable()) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/* No kernelmanagerd to launch the dext (see iokitDaemonAvailable). */
++		return kOSKextReturnUnsupported;
++#else
+ 		panic("Received unexpected request in environment where " kIOKitDaemonName " is unavailable");
++#endif
+ 	}
+ 
+ 	if (serverDUI != NULL) {
