@@ -344,6 +344,9 @@ struct tap {
 	double sumsq;
 	UInt64 nsamples;
 	UInt32 periods, silent;
+	double rs_phase;			/* resampler: next output frame, in input frames after rs_prev */
+	float rs_prev[2];			/* resampler: last input frame of the previous call */
+	UInt64 quiet;				/* frames since this tap last carried a non-zero sample */
 };
 
 /*
@@ -361,8 +364,16 @@ struct tap {
 /*
  * Other mix rates (iOS 18's VirtualAudio runs at 48000 Hz) are resampled to
  * VSND_RATE linearly; the phase and the last input frame carry over between
- * IO cycles, so there are no clicks at buffer boundaries.
+ * IO cycles (per tap), so there are no clicks at buffer boundaries.
+ *
+ * iOS 18 runs several VAD Aggregate Devices at once (system sounds at 48000,
+ * a ringtone at 44100, ...). Only one tap writes /dev/qemuaudio: the owner,
+ * until its device stops or it has been silent for VSND_HANDOVER seconds
+ * while another tap carries sound. (Two taps writing in turn interleaved
+ * their chunks: ringtones came out as noise.)
  */
+#define VSND_HANDOVER	0.25
+static struct tap *vsnd_owner;
 static float tap_sample(const AudioBuffer *b, UInt32 idx, Boolean is_float, UInt32 bits)
 {
 	if (!b->mData || (idx + 1) * (bits / 8) > b->mDataByteSize)
@@ -382,14 +393,20 @@ static void tap_play(struct tap *t, const AudioBufferList *out, UInt32 frames, B
 #if QEMUAUDIO_VSND
 	static int fd = -1;
 	static UInt64 next_open;
-	static Boolean logged_rate;
-	static double phase;		/* position of the next output frame, in input frames after prev */
-	static float prev[2];		/* last input frame of the previous call */
 	double rate = t->fmt.mSampleRate ? t->fmt.mSampleRate : VSND_RATE, ratio = rate / VSND_RATE;
-	if (rate != VSND_RATE && !logged_rate) {
-		qlog("vsnd: %.0f Hz output, resampled to %.0f Hz", rate, VSND_RATE);
-		logged_rate = true;
+	if (vsnd_owner != t) {
+		struct tap *o = vsnd_owner;
+		double o_rate = o && o->fmt.mSampleRate ? o->fmt.mSampleRate : VSND_RATE;
+		if (o && (t->quiet > 0 || o->quiet < VSND_HANDOVER * o_rate))
+			return;
+		vsnd_owner = t;
+		t->rs_phase = 0;
+		t->rs_prev[0] = t->rs_prev[1] = 0;
+		qlog("vsnd: playing device %u (%s), %.0f Hz%s", t->dev, t->name, rate,
+		     rate != VSND_RATE ? ", resampled" : "");
 	}
+	double phase = t->rs_phase;
+	float *prev = t->rs_prev;
 	if (fd < 0) {
 		if (t->frames < next_open)
 			return;
@@ -426,6 +443,7 @@ static void tap_play(struct tap *t, const AudioBufferList *out, UInt32 frames, B
 		}
 	}
 	phase -= frames;
+	t->rs_phase = phase;
 	if (frames) {
 		prev[0] = tap_sample(l, (frames - 1) * step, is_float, bits);
 		prev[1] = tap_sample(r, (frames - 1) * step + roff, is_float, bits);
@@ -434,6 +452,7 @@ static void tap_play(struct tap *t, const AudioBufferList *out, UInt32 frames, B
 		goto failed;
 	return;
 failed:
+	t->rs_phase = phase;
 	qlog("vsnd: write failed (%d), reopening", errno);
 	close(fd);
 	fd = -1;
@@ -463,6 +482,7 @@ static void tap_output(struct tap *t, const AudioBufferList *out)
 		}
 		t->nsamples += n;
 	}
+	t->quiet = t->peak > 0 ? 0 : t->quiet + frames;
 	t->frames += frames;
 	t->calls++;
 	tap_play(t, out, frames, is_float, bits);
@@ -540,6 +560,8 @@ static OSStatus va_devstop(AudioObjectID dev, AudioDeviceIOProcID id)
 {
 	OSStatus err = real_stop(dev, id);
 	qlog("tap: AudioDeviceStop(%u, %p) -> %d", dev, (void *)id, (int)err);
+	if (vsnd_owner && vsnd_owner->dev == dev)
+		vsnd_owner = NULL;
 	return err;
 }
 

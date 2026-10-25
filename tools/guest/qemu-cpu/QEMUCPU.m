@@ -118,6 +118,7 @@ static void image_loaded(const struct mach_header *mh)
 	for (size_t i = 0; i < sizeof(shims) / sizeof(shims[0]); i++) {
 		if (!shim_done[i] && strcmp(info.dli_fname, shims[i].path) == 0) {
 			shim_done[i] = true;
+			qlog("%s loaded, installing its shim", shims[i].path);
 			shims[i].install();
 		}
 	}
@@ -125,5 +126,7 @@ static void image_loaded(const struct mach_header *mh)
 
 __attribute__((constructor)) static void qemucpu_init(void)
 {
+	/* bring-up: shows which processes get the library at all */
+	qlog("loaded");
 	objc_addLoadImageFunc(image_loaded);
 }
