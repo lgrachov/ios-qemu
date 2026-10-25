@@ -21,6 +21,7 @@ This is not Corellium. Corellium boots Apple's own iOS kernel on virtual hardwar
 | GUI | Lock screen with wallpaper, home screen with widgets, the stock apps (Mail, Notes, Calendar, Clock, Maps, …), Settings, Safari |
 | Touch | Mouse clicks and drags in the window (virtio-tablet → HID digitizer) |
 | Keyboard | Attached hardware keyboard (virtio-keyboard → HID). Ctrl+Option+P power, Ctrl+Option+H or Esc home, Ctrl+Option+Up/Down volume |
+| Sound | Plays on the Mac (virtio-sound → CoreAudio): system sounds, ringtones, app audio. Needs `tools/audio-plugin.py setup DISK`; `--no-audio` turns it off. Volume buttons and output routes have no effect |
 | Network | virtio-net as `en0` on QEMU user networking: DHCP, DNS, TCP, QUIC, HTTP and HTTPS in Safari |
 | Clock | Host time through QEMU's PL031 RTC |
 | Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
@@ -29,7 +30,7 @@ This is not Corellium. Corellium boots Apple's own iOS kernel on virtual hardwar
 ## What does not work (yet)
 
 - **Default wallpaper:** a plain blue fallback instead of iOS 16's default, because sandbox extensions are not issued yet. Some daemons (bluetoothd, assetsd) keep restarting.
-- No GPU, no audio, camera, Bluetooth, cellular, location or Face ID.
+- No GPU, microphone, camera, Bluetooth, cellular, location or Face ID.
 - **Security is off:** permissive code signing (AMFI) and Sandbox policies, a stub AppleKeyStore, no data protection.
 
 ## Requirements

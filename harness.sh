@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Boot the local kernel in QEMU with a live display window.
 #
-#   ./harness.sh [--secs N] [--no-display] [--no-log] [--hvf] [--ios DISK] [--metal] [--cpus N] [--serial S] [--bootargs "..."] [--kernel PATH] [-- extra qemu-sweet.py args]
+#   ./harness.sh [--secs N] [--no-display] [--no-log] [--hvf] [--ios DISK] [--no-audio] [--metal] [--cpus N] [--serial S] [--bootargs "..."] [--kernel PATH] [-- extra qemu-sweet.py args]
 #
 # Runs until the QEMU window is closed, the guest powers off or Ctrl-C (which
 # still saves the screen); --secs N stops after N seconds instead.
@@ -11,7 +11,9 @@
 # the iOS root on DISK (tools/mkiosroot-mac.sh disk.img) over emulated UFS with
 # the phone's boot-args (implies --hvf); click/drag in the window = touch,
 # typing = a hardware keyboard, Ctrl+Option+P power, Ctrl+Option+H/Esc home,
-# Ctrl+Option+Up/Down volume (patches 0084, 0089). --metal (with --ios, macOS,
+# Ctrl+Option+Up/Down volume (patches 0084, 0089); sound plays on the host
+# (virtio-sound, CoreAudio; kernel 0108 + tools/audio-plugin.py setup DISK),
+# --no-audio leaves the sound device out. --metal (with --ios, macOS,
 # experimental): Metal remoting: boot-arg sweetmetal=1, shared memory for the
 # guest's QEMUMetal.bundle (tools/metal-plugin.py setup DISK) and the host
 # helper tools/host/qemu-metal-host.m, whose output goes to the run's
@@ -30,6 +32,7 @@ LOG_ARG=--live-log
 HVF=
 IOS_DISK=
 METAL=
+AUDIO=1
 CPUS=
 CMDLINE='debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress'
 EXTRA=()
@@ -48,8 +51,9 @@ while [ $# -gt 0 ]; do
 	--hvf) HVF=--hvf; shift ;;
 	--ios) IOS_DISK=$2; HVF=--hvf; shift 2 ;;
 	--metal) METAL=1; shift ;;
+	--no-audio) AUDIO=; shift ;;
 	--) shift; EXTRA=("$@"); break ;;
-	-h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+	-h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
 	*) echo "unknown option: $1 (see --help)" >&2; exit 1 ;;
 	esac
 done
@@ -66,6 +70,11 @@ if [ -n "$IOS_DISK" ]; then
 	# hardware lock/spin timeouts x20, a vCPU can stall while the host runs
 	# something else (pset lock "Ticket spinlock timeout" panic under load).
 	CMDLINE="$CMDLINE rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetvinput=1 sweetvnet=1 sweettouch=0 ml-timeout-global-scale=20"
+fi
+if [ -n "$IOS_DISK" ] && [ -n "$AUDIO" ]; then
+	# bsd/dev/sweet_vsnd.c (sweetvsnd=1) plays what QEMUAudio.driver writes to /dev/qemuaudio
+	CMDLINE="$CMDLINE sweetvsnd=1"
+	QEMU_ARGS+=(--audio)
 fi
 [ -n "$CPUS" ] || { [ -n "$IOS_DISK" ] && CPUS=4 || CPUS=1; }
 ADT_ARGS="$ADT_ARGS --cpus $CPUS" CMDLINE=${CMDLINE/cpus=1/cpus=$CPUS}

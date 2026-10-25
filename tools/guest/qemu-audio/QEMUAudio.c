@@ -21,12 +21,12 @@
  *     (Device_Speaker_Aspen.cpp).
  *
  * Step 1: the devices run on their own clock (host time at 48 kHz) and only
- * measure what they are given (peak level once a second in the log). Step 2
- * hands the samples to the kernel's virtio-sound driver.
+ * measure what they are given (peak level once a second in the log).
  *
  * VirtualAudio never routes to these devices (its routing database finds no
  * route, so everything plays into its Null_Device). QEMUAUDIO_TAP takes the
- * mix from VirtualAudio's IOProc on its "VAD Aggregate Device" instead.
+ * mix from VirtualAudio's IOProc on its "VAD Aggregate Device" instead, and
+ * QEMUAUDIO_VSND writes it to the kernel's virtio-sound driver.
  *
  * Every property we do not answer is logged once, so the log shows what
  * VirtualAudio asks. Log: /private/var/tmp/QEMUAudio.log and os_log
@@ -35,6 +35,7 @@
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <mach/mach_time.h>
 #include <math.h>
@@ -344,6 +345,71 @@ struct tap {
 	UInt32 periods, silent;
 };
 
+/*
+ * QEMUAUDIO_VSND: the tapped mix goes to the kernel's virtio-sound driver
+ * (patch 0108, boot-arg sweetvsnd=1): /dev/qemuaudio takes S16 stereo at
+ * 44100 Hz and never blocks (the kernel drops what does not fit), so the
+ * write is safe on VirtualAudio's IO thread. Without the device (harness
+ * --no-audio, kernel before 0108) open fails and is retried every ~2 s.
+ */
+#define QEMUAUDIO_VSND 1
+#define VSND_PATH	"/dev/qemuaudio"
+#define VSND_RATE	44100.0
+#define VSND_FRAMES	1024		/* frames per write */
+
+static void tap_play(struct tap *t, const AudioBufferList *out, UInt32 frames, Boolean is_float, UInt32 bits)
+{
+#if QEMUAUDIO_VSND
+	static int fd = -1;
+	static UInt64 next_open;
+	static Boolean warned;
+	if (t->fmt.mSampleRate && t->fmt.mSampleRate != VSND_RATE) {
+		if (!warned)
+			qlog("vsnd: %.0f Hz output, only %.0f Hz is played", t->fmt.mSampleRate, VSND_RATE);
+		warned = true;
+		return;
+	}
+	if (fd < 0) {
+		if (t->frames < next_open)
+			return;
+		next_open = t->frames + 2 * (UInt64)VSND_RATE;
+		fd = open(VSND_PATH, O_WRONLY | O_NONBLOCK);
+		qlog("vsnd: open %s -> %d", VSND_PATH, fd);
+		if (fd < 0)
+			return;
+	}
+	/* interleaved (one buffer, 1-2 channels) or one buffer per channel */
+	const AudioBuffer *l = &out->mBuffers[0];
+	const AudioBuffer *r = out->mNumberBuffers > 1 ? &out->mBuffers[1] : l;
+	UInt32 step = l->mNumberChannels ? l->mNumberChannels : 1, roff = r == l && step > 1 ? 1 : 0;
+	if (r != l)
+		step = 1;
+	SInt16 pcm[VSND_FRAMES * 2];
+	for (UInt32 done = 0; done < frames;) {
+		UInt32 n = frames - done < VSND_FRAMES ? frames - done : VSND_FRAMES;
+		for (UInt32 i = 0; i < 2 * n; i++) {
+			const AudioBuffer *b = i & 1 ? r : l;
+			UInt32 idx = (done + i / 2) * step + (i & 1 ? roff : 0);
+			if (!b->mData || (idx + 1) * (bits / 8) > b->mDataByteSize) {
+				pcm[i] = 0;
+				continue;
+			}
+			float v = is_float ? ((const Float32 *)b->mData)[idx]
+			        : bits == 16 ? ((const SInt16 *)b->mData)[idx] / 32768.0f
+			        : ((const SInt32 *)b->mData)[idx] / 2147483648.0f;
+			pcm[i] = v >= 1.0f ? 32767 : v <= -1.0f ? -32768 : (SInt16)lrintf(v * 32767.0f);
+		}
+		if (write(fd, pcm, n * 4) < 0) {
+			qlog("vsnd: write failed (%d), reopening", errno);
+			close(fd);
+			fd = -1;
+			return;
+		}
+		done += n;
+	}
+#endif
+}
+
 static void tap_output(struct tap *t, const AudioBufferList *out)
 {
 	UInt32 frames = 0;
@@ -369,6 +435,7 @@ static void tap_output(struct tap *t, const AudioBufferList *out)
 	}
 	t->frames += frames;
 	t->calls++;
+	tap_play(t, out, frames, is_float, bits);
 	if (t->frames / TAP_REPORT == (t->frames - frames) / TAP_REPORT)
 		return;
 	if (t->peak > 0 || t->periods == 0 || ++t->silent >= TAP_SILENT) {
@@ -515,6 +582,7 @@ static void trace_va(void)
 #define QEMUAUDIO_REROUTE 0	/* 2026-10-25: accepted; at 5/15 s and at 45/60 s (ringer on, devices in) still pap -> pnul */
 #if QEMUAUDIO_REROUTE
 #include <dispatch/dispatch.h>
+#include <errno.h>
 #include <dlfcn.h>
 
 static void reroute(void)
