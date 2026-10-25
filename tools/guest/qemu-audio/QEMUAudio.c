@@ -347,6 +347,7 @@ struct tap {
 	double rs_phase;			/* resampler: next output frame, in input frames after rs_prev */
 	float rs_prev[2];			/* resampler: last input frame of the previous call */
 	UInt64 quiet;				/* frames since this tap last carried a non-zero sample */
+	UInt64 last_ns;				/* CLOCK_UPTIME_RAW of the last IO cycle */
 };
 
 /*
@@ -368,8 +369,9 @@ struct tap {
  *
  * iOS 18 runs several VAD Aggregate Devices at once (system sounds at 48000,
  * a ringtone at 44100, ...). Only one tap writes /dev/qemuaudio: the owner,
- * until its device stops or it has been silent for VSND_HANDOVER seconds
- * while another tap carries sound. (Two taps writing in turn interleaved
+ * until its device stops, its IO cycles stop coming (a stopped device can
+ * still deliver one late cycle) or it has been silent for VSND_HANDOVER
+ * seconds while another tap carries sound. (Two taps writing in turn interleaved
  * their chunks: ringtones came out as noise.)
  */
 #define VSND_HANDOVER	0.25
@@ -397,7 +399,8 @@ static void tap_play(struct tap *t, const AudioBufferList *out, UInt32 frames, B
 	if (vsnd_owner != t) {
 		struct tap *o = vsnd_owner;
 		double o_rate = o && o->fmt.mSampleRate ? o->fmt.mSampleRate : VSND_RATE;
-		if (o && (t->quiet > 0 || o->quiet < VSND_HANDOVER * o_rate))
+		bool o_gone = o && t->last_ns - o->last_ns > (UInt64)(VSND_HANDOVER * 1e9);
+		if (o && !o_gone && (t->quiet > 0 || o->quiet < VSND_HANDOVER * o_rate))
 			return;
 		vsnd_owner = t;
 		t->rs_phase = 0;
@@ -483,6 +486,7 @@ static void tap_output(struct tap *t, const AudioBufferList *out)
 		t->nsamples += n;
 	}
 	t->quiet = t->peak > 0 ? 0 : t->quiet + frames;
+	t->last_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 	t->frames += frames;
 	t->calls++;
 	tap_play(t, out, frames, is_float, bits);
