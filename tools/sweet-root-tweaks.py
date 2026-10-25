@@ -32,7 +32,6 @@ screen (image versions v8-v14 in NOTES.md):
 """
 import glob, os, plistlib, shutil, sys
 
-BUILD, VERSION = '20H392', '16.7.16'
 # launchd jobs that must not run here:
 #   CommCenter  no baseband (see above)
 #   locationd   deadlocks itself during boot without location hardware (QEMU,
@@ -112,7 +111,14 @@ def find_container(root, kind, identifier):
     return None
 
 
+def system_version(root):
+    """(build, version) of the iOS in the image, e.g. ('20H392', '16.7.16')."""
+    v = load(os.path.join(root, 'System/Library/CoreServices/SystemVersion.plist'))
+    return v['ProductBuildVersion'], v['ProductVersion']
+
+
 def activation(root):
+    build, version = system_version(root)
     c = find_container(root, 'Data/System', 'com.apple.mobileactivationd')
     if c is None:
         print('warning: no mobileactivationd system container in the image; skipped data ark')
@@ -123,7 +129,7 @@ def activation(root):
     os.chmod(d, 0o755)
     save(os.path.join(d, 'data_ark.plist'), {
         '-ActivationState': 'Activated', '-BrickState': False,
-        '-BuildVersion': BUILD, '-ProductVersion': VERSION,
+        '-BuildVersion': build, '-ProductVersion': version,
         '-DataMigrationCompleted': True, '-PreSydroDataMigrationCompleted': True,
     }, MOBILE, MOBILE, 0o600)
     print('data ark', d)
@@ -154,7 +160,7 @@ def main():
     activation(root)
     audio(root)
     merge_pref(root, 'com.apple.migration', {
-        'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
+        'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': system_version(root)[0]}})
     merge_pref(root, 'com.apple.springboard', {
         'BKNoWatchdogs': True,
         'FBLaunchWatchdogExceptions': {'com.apple.purplebuddy': 100.0},
