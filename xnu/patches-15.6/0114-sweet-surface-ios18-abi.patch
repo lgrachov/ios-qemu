@@ -1,12 +1,15 @@
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index 244012dd3c7be1f51b4ff90da6de28bb207557b5..9c48acdd4e942dd2812c8d2ec655b3f25c10ba87 100644
+index 244012dd3c7be1f51b4ff90da6de28bb207557b5..6b9444810d50852b184ea17c6f7baff20dbc756b 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -7,8 +7,10 @@
+@@ -7,8 +7,13 @@
   *
   *   sel 13  limits: struct out 0x18, u16 at +0x16 must be 1 (ABI version),
   *           +0 offset alignment mask, +4 bytes-per-row alignment mask
-+ *           (iOS 18: struct out 0x28, version at +0x22)
++ *           (iOS 18: struct out 0x28, version at +0x22; +0x08/+0x10/+0x18 u64
++ *           maximum bytes per row / width / height, which
++ *           IOSurfaceGetPropertyMaximum returns: 0 made CoreImage's CPU
++ *           renderer refuse every destination, "destination too big")
   *   sel 0   create: scalar [parent id], struct in = serialized property
 - *           dictionary (binary or XML), struct out = lock result (0xa68)
 + *           dictionary (binary or XML), struct out = lock result (0xa68;
@@ -14,7 +17,7 @@ index 244012dd3c7be1f51b4ff90da6de28bb207557b5..9c48acdd4e942dd2812c8d2ec655b3f2
   *   sel 4   lookup by id: scalar [id], struct out = lock result
   *   sel 34  lookup by mach port: scalar [port name], struct out = lock result
   *   sel 35  create mach port: scalars [id, options], scalar out [port name]
-@@ -59,6 +61,7 @@ enum {
+@@ -59,11 +64,14 @@ enum {
  };
  
  #define SWEET_SURFACE_RESULT_SIZE       0xa68
@@ -22,7 +25,14 @@ index 244012dd3c7be1f51b4ff90da6de28bb207557b5..9c48acdd4e942dd2812c8d2ec655b3f2
  #define SWEET_SURFACE_MAX_ID            4096
  #define SWEET_SURFACE_MAX_DIM           16384
  #define SWEET_SURFACE_MAX_ALLOC         (256u << 20)
-@@ -729,6 +732,59 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ #define SWEET_SURFACE_MAX_PROPS         (64u << 10)
+ #define SWEET_SURFACE_ROW_ALIGN         64
++#define SWEET_SURFACE_MAX_SIZE          16384
++#define SWEET_SURFACE_MAX_BYTES_PER_ROW (SWEET_SURFACE_MAX_SIZE * 16)
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
+ #define kIOSurfaceLockReadOnly          0x1
+@@ -729,6 +737,59 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
  	}
  }
  
@@ -82,7 +92,7 @@ index 244012dd3c7be1f51b4ff90da6de28bb207557b5..9c48acdd4e942dd2812c8d2ec655b3f2
  static IOReturn
  sweet_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
  {
-@@ -758,16 +814,22 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArgument
+@@ -758,16 +819,22 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArgument
  	if (ret != kIOReturnSuccess) {
  		return ret;
  	}
@@ -109,7 +119,7 @@ index 244012dd3c7be1f51b4ff90da6de28bb207557b5..9c48acdd4e942dd2812c8d2ec655b3f2
  	}
  	if (ret != kIOReturnSuccess && !existing) {
  		/* The caller never learns the id: undo this create/lookup. */
-@@ -877,12 +939,13 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+@@ -877,12 +944,18 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
  
  	switch (selector) {
  	case kSweetSurfaceLimits: {
@@ -119,6 +129,11 @@ index 244012dd3c7be1f51b4ff90da6de28bb207557b5..9c48acdd4e942dd2812c8d2ec655b3f2
  		put32(limits, 0x0, SWEET_SURFACE_ROW_ALIGN - 1);
  		put32(limits, 0x4, SWEET_SURFACE_ROW_ALIGN - 1);
 -		limits[0x16] = 1;
++		if (ios18) {
++			put64(limits, 0x08, SWEET_SURFACE_MAX_BYTES_PER_ROW);
++			put64(limits, 0x10, SWEET_SURFACE_MAX_SIZE);
++			put64(limits, 0x18, SWEET_SURFACE_MAX_SIZE);
++		}
 +		limits[ios18 ? 0x22 : 0x16] = 1;
  		sweet_surf_log_once("sel", selector);
 -		return sweet_struct_out(args, limits, sizeof(limits));
