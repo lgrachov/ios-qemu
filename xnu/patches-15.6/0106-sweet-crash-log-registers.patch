@@ -1,8 +1,24 @@
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index b7fbdf613eb393db88dbdef4714d106b042aa1fb..16a10a5997fa75981a88a19bb5880d55c9e465e6 100644
+index b7fbdf613eb393db88dbdef4714d106b042aa1fb..293b4fc31fefaa592e1d20dac967910ef458ebad 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -967,6 +967,8 @@ exception_triage(
+@@ -886,6 +886,15 @@ maybe_unrecoverable_exception_triage(
+ 	int pid = proc_selfpid();
+ 	char *proc_name = proc_name_address(proc);
+ 	os_log_error(OS_LOG_DEFAULT, "%s: process %s[%d] hit an unrecoverable exception\n", __func__, proc_name, pid);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET: brk #0xb001 (os_crash and friends in libplatform, dyld, ...)
++	 * ends here and the process exits without a signal, so proc_prepareexit
++	 * never prints a crash report: print it now (as SIGTRAP).
++	 */
++	extern void sweet_crash_log(const char *, int, int, uint64_t, uint64_t);
++	sweet_crash_log(proc_name, pid, 5 /* SIGTRAP */, ((uint64_t)exception << 32) | (uint32_t)code[0], code[1]);
++#endif
+ 
+ 	exception_info_t info = {
+ 		/*
+@@ -967,6 +976,8 @@ exception_triage(
  
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <vm/vm_shared_region.h>
@@ -11,7 +27,7 @@ index b7fbdf613eb393db88dbdef4714d106b042aa1fb..16a10a5997fa75981a88a19bb5880d55
  #include <arm/thread.h>
  
  /*
-@@ -1018,6 +1020,15 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+@@ -1018,6 +1029,15 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
  	}
  	printf("%s\n", line);
  
