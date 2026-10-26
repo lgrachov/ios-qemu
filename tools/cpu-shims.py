@@ -39,8 +39,8 @@ def setup(mnt):
     shutil.copyfile(OUT, dst)
     os.chmod(dst, 0o755)
     log = os.path.join(mnt, 'private/var/tmp/QEMUCPU.log')
-    if os.path.exists(log):
-        open(log, 'w').close()
+    open(log, 'w').close()
+    os.chmod(log, 0o666)	# mobile processes (SpringBoard, apps, iconservicesagent) log too
     print(f'/{GUEST_PATH} installed')
 
 

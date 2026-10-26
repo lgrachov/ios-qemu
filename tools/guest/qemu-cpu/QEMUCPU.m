@@ -34,6 +34,7 @@
 #include <objc/runtime.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -46,6 +47,7 @@ static void qlog(const char *fmt, ...)
 	va_end(ap);
 	int fd = open("/private/var/tmp/QEMUCPU.log", O_WRONLY | O_APPEND | O_CREAT, 0666);
 	if (fd >= 0) {
+		fchmod(fd, 0666);	/* root creates it first; mobile processes append too */
 		dprintf(fd, "%s[%d] %s\n", getprogname(), getpid(), msg);
 		close(fd);
 	}
