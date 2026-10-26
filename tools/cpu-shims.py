@@ -7,8 +7,7 @@
 
 The VM must be stopped. The iOS 18 kernel (patches-15.6/0115) inserts the
 library into every process through DYLD_INSERT_LIBRARIES; without the file
-dyld just skips it. Log: /private/var/tmp/QEMUCPU.log (cleared by setup) and
-os_log.
+dyld just skips it. Log: /private/var/tmp/QEMUCPU.log (cleared by setup).
 """
 import os, shutil, subprocess, sys
 

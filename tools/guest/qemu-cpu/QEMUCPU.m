@@ -6,8 +6,12 @@
  * inserted into every process by the SWEET kernel (patches-15.6/0115: exec
  * adds DYLD_INSERT_LIBRARIES=/usr/lib/qemu/libQEMUCPU.dylib), makes them pick
  * it whenever there is no Metal device. Each shim is installed only when its
- * framework's classes are loaded (objc_addLoadImageFunc), so processes that
- * never use a framework are not touched.
+ * framework is loaded (_dyld_register_func_for_add_image), so processes that
+ * never use a framework are not touched. Not objc_addLoadImageFunc: iOS 18's
+ * libobjc calls it with runtimeLock held (and also for shared-cache images
+ * the process never loaded), so the shim's objc_getClass aborted in
+ * os_unfair_lock_recursive_abort (/sbin/mount, the first process, killed the
+ * boot).
  *
  * Shims:
  *   CoreImage  -[CIContext initWithOptions:] uses Metal, else OpenGL ES, else
@@ -17,14 +21,17 @@
  *              a Metal device the shim builds the software context instead
  *              (iconservicesagent's SF Symbol icons: Settings rows).
  *
- * Log: os_log and /private/var/tmp/QEMUCPU.log (one line per shim and
- * process). Built and installed by tools/cpu-shims.py.
+ * Log: /private/var/tmp/QEMUCPU.log only (one line per shim and process).
+ * No os_log: the first os_log of a process registers with logd and waits for
+ * the reply; logd runs this constructor too, so it waited on itself and
+ * every process behind it (boot stalled at 0.6 s).
+ * Built and installed by tools/cpu-shims.py.
  */
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
 #include <fcntl.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
-#include <os/log.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -37,7 +44,6 @@ static void qlog(const char *fmt, ...)
 	va_start(ap, fmt);
 	vsnprintf(msg, sizeof(msg), fmt, ap);
 	va_end(ap);
-	os_log(OS_LOG_DEFAULT, "QEMUCPU: %{public}s", msg);
 	int fd = open("/private/var/tmp/QEMUCPU.log", O_WRONLY | O_APPEND | O_CREAT, 0666);
 	if (fd >= 0) {
 		dprintf(fd, "%s[%d] %s\n", getprogname(), getpid(), msg);
@@ -109,7 +115,7 @@ static const struct {
 };
 static bool shim_done[sizeof(shims) / sizeof(shims[0])];
 
-static void image_loaded(const struct mach_header *mh)
+static void image_loaded(const struct mach_header *mh, __unused intptr_t slide)
 {
 	Dl_info info;
 	if (!dladdr(mh, &info) || !info.dli_fname) {
@@ -128,5 +134,5 @@ __attribute__((constructor)) static void qemucpu_init(void)
 {
 	/* bring-up: shows which processes get the library at all */
 	qlog("loaded");
-	objc_addLoadImageFunc(image_loaded);
+	_dyld_register_func_for_add_image(image_loaded);
 }
