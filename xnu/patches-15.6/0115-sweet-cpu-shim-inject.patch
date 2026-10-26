@@ -74,10 +74,18 @@ index 34a3c4af8b9393c2a8d86be9178c32a9ebfe0dd8..816c1666dcbfe3269e28a3ff4c030ade
  	if (imgp->ip_argspace < new_ptr_size) {
  		error = E2BIG;
 diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
-index 941d0667e06c270a5f2cc6852c5e6c02ea1534fe..c596d9ed01b43a03e0619c3c1c7002961c6010f2 100644
+index 941d0667e06c270a5f2cc6852c5e6c02ea1534fe..98aa740b1663bcf8193666bbc89a9d35b0503487 100644
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -497,20 +497,24 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+@@ -29,6 +29,7 @@
+ #include <libkern/OSAtomic.h>
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
++#include <pexpert/pexpert.h>
+ #include <sys/codesign.h>
+ #include <sys/kauth.h>
+ #include <sys/mount.h>
+@@ -497,20 +498,27 @@ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
   *
   * Call 0x5a is dyld's amfi_check_dyld_policy_self(): arg points to
   * { u64 input flags, u64 *output flags }; the output bits are what dyld may do
@@ -89,29 +97,31 @@ index 941d0667e06c270a5f2cc6852c5e6c02ea1534fe..c596d9ed01b43a03e0619c3c1c700296
 - * (security policy does not allow @ path expansion)". SWEET answers 0x9,
 - * @-paths and fallback paths, as for a normal third-party app; DYLD_*
 - * variables and interposing stay off as before.
-+ * for this process (iOS 18 dyld4 ProcessConfig::Security stores bit N at
-+ * +0x11+N: 0 @-path expansion, 1 printing variables, 2 DYLD_* path
-+ * variables (PathOverrides parses DYLD_* only with it), 3 custom shared
-+ * cache, 4 classic fallback paths, 5 failed insertions, 6 interposing,
-+ * 7 embedded variables). Unanswered, dyld uses 0: system binaries are fine,
-+ * but apps with embedded frameworks die with "Library not loaded:
-+ * @rpath/... (security policy does not allow @ path expansion)". SWEET
-+ * answers @-paths, DYLD_* variables (for libQEMUCPU.dylib, see kern_exec.c),
-+ * fallback paths and failed insertions; interposing stays off.
++ * for this process (AMFI's flags; iOS 18 dyld4 ProcessConfig::Security keeps
++ * them as bytes in its own order: +0x11 bit 0 @-path expansion, +0x12 bit 4
++ * printing variables, +0x13 bit 1 DYLD_* path variables (PathOverrides
++ * parses DYLD_* only with it), +0x14 bit 2 custom shared cache, +0x15 bit 3
++ * classic fallback paths, +0x16 bit 5 failed insertions, bit 6 interposing,
++ * bit 7 embedded variables; checked in dyld's Security constructor).
++ * Unanswered, dyld uses 0: system binaries are fine, but apps with embedded
++ * frameworks die with "Library not loaded: @rpath/... (security policy does
++ * not allow @ path expansion)". SWEET answers @-paths, DYLD_* path variables
++ * (for libQEMUCPU.dylib, see kern_exec.c), fallback paths and failed
++ * insertions; interposing stays off. Boot-arg sweetdyldstrict=NAME leaves
++ * failed insertions out for process NAME, so dyld stops it with the reason
++ * an inserted library did not load (shown by the kernel's CRASH line).
   */
  #define SWEET_AMFI_QUERY_BOOTARG_STATE          0x60
  #define SWEET_AMFI_BOOTARG_ENFORCEMENT_OFF      0x86ULL
  #define SWEET_AMFI_DYLD_POLICY                  0x5a
  #define SWEET_AMFI_DYLD_ALLOW_AT_PATH           0x1ULL
--#define SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS    0x8ULL
-+#define SWEET_AMFI_DYLD_ALLOW_ENV_PATH          0x4ULL
-+#define SWEET_AMFI_DYLD_ALLOW_SHARED_CACHE_ENV  0x8ULL  /* in 0x9 before; kept */
-+#define SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS    0x10ULL
++#define SWEET_AMFI_DYLD_ALLOW_ENV_PATH          0x2ULL
+ #define SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS    0x8ULL
 +#define SWEET_AMFI_DYLD_ALLOW_INSERT_FAILURES   0x20ULL
  
  static int
  sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
-@@ -528,7 +532,14 @@ sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
+@@ -528,7 +536,19 @@ sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
  		if (error) {
  			return error;
  		}
@@ -122,8 +132,13 @@ index 941d0667e06c270a5f2cc6852c5e6c02ea1534fe..c596d9ed01b43a03e0619c3c1c700296
 +			printf("SWEET AMFI: dyld policy query from %s (input %#llx)\n", proc_best_name(current_proc()), args.input);
 +		}
 +		uint64_t policy = SWEET_AMFI_DYLD_ALLOW_AT_PATH | SWEET_AMFI_DYLD_ALLOW_ENV_PATH |
-+		    SWEET_AMFI_DYLD_ALLOW_SHARED_CACHE_ENV | SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS |
-+		    SWEET_AMFI_DYLD_ALLOW_INSERT_FAILURES;
++		    SWEET_AMFI_DYLD_ALLOW_FALLBACK_PATHS | SWEET_AMFI_DYLD_ALLOW_INSERT_FAILURES;
++		char strict[32];
++		if (PE_parse_boot_argn("sweetdyldstrict", strict, sizeof(strict)) &&
++		    strcmp(strict, proc_best_name(current_proc())) == 0) {
++			policy &= ~SWEET_AMFI_DYLD_ALLOW_INSERT_FAILURES;
++			printf("SWEET AMFI: dyld policy %#llx for %s (sweetdyldstrict)\n", policy, strict);
++		}
  		return copyout(&policy, args.output, sizeof(policy));
  	}
  	return ENOPOLICY;
